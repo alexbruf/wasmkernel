@@ -184,6 +184,8 @@ wasi_proc_exit(wasm_exec_env_t exec_env, uint64 *args)
     native_raw_get_arg(int32, code, args);
     g_exit_code = code;
     g_exited_via_proc_exit = true;
+    g_scheduler.exited_via_proc_exit = true;
+    g_scheduler.exit_code = code;
     wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
     wasm_runtime_set_exception(inst, "proc_exit");
 }
@@ -494,4 +496,25 @@ int32_t
 kernel_exit_code(void)
 {
     return g_exit_code;
+}
+
+__attribute__((export_name("kernel_set_fuel")))
+void
+kernel_set_fuel(uint32_t fuel_per_slice)
+{
+    if (fuel_per_slice > 0)
+        g_scheduler.fuel_per_slice = fuel_per_slice;
+}
+
+__attribute__((export_name("kernel_thread_count")))
+uint32_t
+kernel_thread_count(void)
+{
+    uint32_t live = 0;
+    for (uint32_t i = 0; i < g_scheduler.num_threads; i++) {
+        WasmKernelThreadState s = g_scheduler.threads[i].state;
+        if (s != THREAD_EXITED && s != THREAD_UNUSED)
+            live++;
+    }
+    return live;
 }

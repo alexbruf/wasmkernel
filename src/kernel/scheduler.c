@@ -327,6 +327,12 @@ wasmkernel_scheduler_step(void)
     /* Determine what happened */
     wasm_module_inst_t inst = wasm_runtime_get_module_inst(thread->exec_env);
 
+    /* Check proc_exit flag (set by WASI handler, may be on any thread) */
+    if (g_scheduler.exited_via_proc_exit) {
+        terminate_all_threads();
+        return -2;
+    }
+
     /* Check if yielded (fuel exhausted or atomic.wait) */
     if (thread->exec_env
         && (WASM_SUSPEND_FLAGS_GET(thread->exec_env->suspend_flags)

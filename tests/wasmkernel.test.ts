@@ -1,12 +1,12 @@
 /**
- * WasmKernel Phase 1 test suite.
+ * WasmKernel test suite.
  *
  * Tests the kernel by loading guest .wasm modules and verifying
  * return codes and output via subprocess execution.
  */
 
 import { describe, test, expect } from "bun:test";
-import { readFileSync, statSync } from "fs";
+import { statSync } from "fs";
 import { join, resolve } from "path";
 
 const ROOT = resolve(import.meta.dir, "..");
@@ -83,7 +83,6 @@ describe("Phase 1: guest execution", () => {
   });
 
   test("invalid module", async () => {
-    // Try loading garbage bytes — the runner should exit 1
     const result = await runGuest("hello.c"); // .c file is not valid wasm
     expect(result.exitCode).not.toBe(0);
   });
@@ -126,6 +125,63 @@ describe("Phase 3: I/O bridge", () => {
     const result = await runGuest("sleep_and_compute.wasm");
     expect(result.stdout).toContain("sleep_and_compute ok");
     expect(result.stdout).toContain("sum=500500");
+    const s = parseStatus(result.stderr);
+    expect(s?.status).toBe(1);
+  });
+});
+
+describe("Phase 4: hardening (WAMR wasi-threads test suite)", () => {
+  test("4 threads atomic counter (global_atomic)", async () => {
+    const result = await runGuest("wamr_global_atomic.wasm");
+    expect(result.stdout).toContain("Value of count after update: 4000");
+    const s = parseStatus(result.stderr);
+    expect(s?.status).toBe(1);
+  });
+
+  test("spawn 50 sequential threads (spawn_multiple_times)", async () => {
+    const result = await runGuest("wamr_spawn_multiple.wasm");
+    const s = parseStatus(result.stderr);
+    expect(s?.status).toBe(1);
+  }, 30000);
+
+  test("proc_exit from spawned thread — atomic wait (nonmain_proc_exit_wait)", async () => {
+    const result = await runGuest("wamr_nonmain_proc_exit_wait.wasm");
+    const s = parseStatus(result.stderr);
+    expect(s?.status).toBe(-2);
+    expect(s?.exitCode).toBe(33);
+  });
+
+  test("proc_exit from spawned thread — busy loop (nonmain_proc_exit_busy)", async () => {
+    const result = await runGuest("wamr_nonmain_proc_exit_busy.wasm");
+    const s = parseStatus(result.stderr);
+    expect(s?.status).toBe(-2);
+    expect(s?.exitCode).toBe(33);
+  });
+
+  test("trap from spawned thread — atomic wait (nonmain_trap_wait)", async () => {
+    const result = await runGuest("wamr_nonmain_trap_wait.wasm");
+    const s = parseStatus(result.stderr);
+    expect(s?.status).toBe(-1);
+  });
+
+  test("trap from spawned thread — busy loop (nonmain_trap_busy)", async () => {
+    const result = await runGuest("wamr_nonmain_trap_busy.wasm");
+    const s = parseStatus(result.stderr);
+    expect(s?.status).toBe(-1);
+  });
+
+  test("stack overflow trapped cleanly", async () => {
+    const result = await runGuest("stack_overflow.wasm");
+    const s = parseStatus(result.stderr);
+    expect(s?.status).toBe(-1);
+    expect(result.exitCode).toBe(1);
+  });
+
+  test("fuel fairness: both threads make progress", async () => {
+    const result = await runGuest("fuel_fairness.wasm");
+    expect(result.stdout).toContain("fuel_fairness ok");
+    expect(result.stdout).toContain("a=1000");
+    expect(result.stdout).toContain("b=1000");
     const s = parseStatus(result.stderr);
     expect(s?.status).toBe(1);
   });
