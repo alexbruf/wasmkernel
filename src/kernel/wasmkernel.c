@@ -837,6 +837,30 @@ kernel_call(uint32_t func_name_ptr, uint32_t argv_ptr, uint32_t argc)
     return 0;
 }
 
+/* Call a guest function by its indirect table index.
+ * Used for N-API callbacks — the guest registers function pointers
+ * (table indices) that the host needs to call back into.
+ * argv_ptr points to uint32 args in kernel memory.
+ * Return value written to argv[0]. Returns 0 on success. */
+__attribute__((export_name("kernel_call_indirect")))
+int32_t
+kernel_call_indirect(uint32_t table_idx, uint32_t argc, uint32_t argv_ptr)
+{
+    if (!g_guest_instance || !g_guest_exec_env)
+        return -1;
+
+    uint32_t *argv = argv_ptr ? (uint32_t *)(uintptr_t)argv_ptr : NULL;
+    if (!wasm_runtime_call_indirect(g_guest_exec_env, table_idx, argc, argv)) {
+        const char *exc = wasm_runtime_get_exception(g_guest_instance);
+        if (exc) {
+            fprintf(stderr, "kernel_call_indirect(%u): %s\n", table_idx, exc);
+            wasm_runtime_clear_exception(g_guest_instance);
+        }
+        return -3;
+    }
+    return 0;
+}
+
 __attribute__((export_name("kernel_set_fuel")))
 void
 kernel_set_fuel(uint32_t fuel_per_slice)

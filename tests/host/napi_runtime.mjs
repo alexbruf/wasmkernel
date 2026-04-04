@@ -87,6 +87,14 @@ export class NapiRuntime {
     return new TextDecoder().decode(bytes);
   }
 
+  _readNullTermString(guestPtr) {
+    const base = this._guestBase();
+    const mem = new Uint8Array(this.k.memory.buffer);
+    let end = guestPtr;
+    while (mem[base + end] !== 0) end++;
+    return this._readString(guestPtr, end - guestPtr);
+  }
+
   _writeString(guestPtr, maxLen, str) {
     const base = this._guestBase();
     const bytes = new TextEncoder().encode(str);
@@ -160,12 +168,7 @@ export class NapiRuntime {
     const [env, objectHandle, namePtr, valueHandle] = args;
     const obj = this._getHandle(objectHandle);
     const val = this._getHandle(valueHandle);
-    // Read null-terminated name
-    const base = this._guestBase();
-    const mem = new Uint8Array(this.k.memory.buffer);
-    let end = namePtr;
-    while (mem[base + end] !== 0) end++;
-    const name = this._readString(namePtr, end - namePtr);
+    const name = this._readNullTermString(namePtr);
     if (obj && typeof obj === 'object') obj[name] = val;
     return napi_ok;
   }
@@ -173,11 +176,7 @@ export class NapiRuntime {
   napi_get_named_property(args) {
     const [env, objectHandle, namePtr, resultPtr] = args;
     const obj = this._getHandle(objectHandle);
-    const base = this._guestBase();
-    const mem = new Uint8Array(this.k.memory.buffer);
-    let end = namePtr;
-    while (mem[base + end] !== 0) end++;
-    const name = this._readString(namePtr, end - namePtr);
+    const name = this._readNullTermString(namePtr);
     const val = obj?.[name];
     const h = this._newHandle(val);
     this._writeResult(resultPtr, h);
@@ -221,22 +220,46 @@ export class NapiRuntime {
     return napi_ok;
   }
 
+  // Call back into guest via kernel_call_indirect
+  _callGuestCallback(tableIdx, envHandle, cbInfoId) {
+    const argvPtr = this.k.kernel_alloc(8);
+    const dv = new DataView(this.k.memory.buffer);
+    dv.setUint32(argvPtr, envHandle, true);
+    dv.setUint32(argvPtr + 4, cbInfoId, true);
+    const result = this.k.kernel_call_indirect(tableIdx, 2, argvPtr);
+    if (result !== 0) return this.undefinedHandle;
+    // Return value is in argv[0]
+    return dv.getUint32(argvPtr, true);
+  }
+
+  // Create a JS function that calls back into a guest wasm callback
+  _makeCallbackFunction(tableIdx, dataPtr) {
+    const self = this;
+    return function(...jsArgs) {
+      const argHandles = jsArgs.map(a => self._newHandle(a));
+      const cbInfoId = self.nextHandle++;
+      self.cbInfoStack.push({
+        id: cbInfoId,
+        thisHandle: self._newHandle(this),
+        args: argHandles,
+        data: dataPtr,
+      });
+      const resultHandle = self._callGuestCallback(tableIdx, 1, cbInfoId);
+      self.cbInfoStack.pop();
+      return self._getHandle(resultHandle);
+    };
+  }
+
   napi_create_function(args) {
     const [env, namePtr, nameLen, cbPtr, dataPtr, resultPtr] = args;
-    // cbPtr is a function table index in the guest
-    // We create a JS function that, when called, will invoke the guest callback
-    const funcId = cbPtr;
-    const funcData = dataPtr;
-    const self = this;
-    const fn = function(...jsArgs) {
-      // Store cb info for napi_get_cb_info
-      const argHandles = jsArgs.map(a => self._newHandle(a));
-      self.cbInfoStack.push({ thisHandle: self._newHandle(this), args: argHandles, data: funcData });
-      // TODO: actually call back into the guest via kernel
-      // For now, return undefined
-      self.cbInfoStack.pop();
-      return undefined;
-    };
+    const fn = this._makeCallbackFunction(cbPtr, dataPtr);
+    // Set function name if provided
+    if (namePtr && nameLen > 0) {
+      const name = nameLen === 0xFFFFFFFF
+        ? this._readNullTermString(namePtr)
+        : this._readString(namePtr, nameLen);
+      Object.defineProperty(fn, 'name', { value: name });
+    }
     const h = this._newHandle(fn);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -334,20 +357,61 @@ export class NapiRuntime {
 
   napi_define_class(args) {
     const [env, namePtr, nameLen, ctorCbPtr, ctorData, propCount, propsPtr, resultPtr] = args;
-    // Create a JS class (constructor function)
     const className = nameLen === 0xFFFFFFFF
-      ? (() => { const m = new Uint8Array(this.k.memory.buffer); const b = this._guestBase(); let e = namePtr; while(m[b+e]) e++; return this._readString(namePtr, e-namePtr); })()
+      ? this._readNullTermString(namePtr)
       : this._readString(namePtr, nameLen);
 
     const self = this;
+    // Create constructor that calls guest callback
     const ctor = function(...jsArgs) {
-      // Store info for napi_get_cb_info
       const argHandles = jsArgs.map(a => self._newHandle(a));
-      self.cbInfoStack.push({ thisHandle: self._newHandle(this), args: argHandles, data: ctorData });
-      // TODO: call back into guest constructor
+      const cbInfoId = self.nextHandle++;
+      const thisHandle = self._newHandle(this);
+      self.cbInfoStack.push({
+        id: cbInfoId, thisHandle, args: argHandles, data: ctorData,
+      });
+      self._callGuestCallback(ctorCbPtr, 1, cbInfoId);
       self.cbInfoStack.pop();
     };
     Object.defineProperty(ctor, 'name', { value: className });
+
+    // Parse property descriptors and add methods to prototype
+    // napi_property_descriptor layout (wasm32):
+    //   utf8name: i32 (0), name: i32 (4), method: i32 (8), getter: i32 (12),
+    //   setter: i32 (16), value: i32 (20), attributes: i32 (24), data: i32 (28)
+    // Total: 32 bytes per descriptor
+    const PROP_SIZE = 32;
+    for (let i = 0; i < propCount; i++) {
+      const base = propsPtr + i * PROP_SIZE;
+      const utf8namePtr = this._readU32(base + 0);
+      const methodCb = this._readU32(base + 8);
+      const getterCb = this._readU32(base + 12);
+      const setterCb = this._readU32(base + 16);
+      const valueHandle = this._readU32(base + 20);
+      const attributes = this._readU32(base + 24);
+      const propData = this._readU32(base + 28);
+
+      let propName = '';
+      if (utf8namePtr) {
+        propName = this._readNullTermString(utf8namePtr);
+      }
+      if (!propName) continue;
+
+      const isStatic = (attributes & (1 << 10)) !== 0; // napi_static = 1 << 10
+      const target = isStatic ? ctor : ctor.prototype;
+
+      if (methodCb) {
+        target[propName] = this._makeCallbackFunction(methodCb, propData);
+      } else if (getterCb || setterCb) {
+        const desc = {};
+        if (getterCb) desc.get = this._makeCallbackFunction(getterCb, propData);
+        if (setterCb) desc.set = this._makeCallbackFunction(setterCb, propData);
+        Object.defineProperty(target, propName, desc);
+      } else if (valueHandle) {
+        target[propName] = this._getHandle(valueHandle);
+      }
+    }
+
     const h = this._newHandle(ctor);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -355,7 +419,9 @@ export class NapiRuntime {
 
   napi_get_cb_info(args) {
     const [env, cbInfo, argcPtr, argvPtr, thisPtr, dataPtr] = args;
-    const info = this.cbInfoStack[this.cbInfoStack.length - 1];
+    // Find the cb info by ID (cbInfo is the ID we passed to the guest)
+    const info = this.cbInfoStack.find(i => i.id === cbInfo)
+      || this.cbInfoStack[this.cbInfoStack.length - 1];
     if (!info) return napi_generic_failure;
 
     if (argcPtr) {
@@ -365,6 +431,10 @@ export class NapiRuntime {
       if (argvPtr) {
         for (let i = 0; i < Math.min(maxArgs, actualArgs); i++) {
           this._writeU32(argvPtr + i * 4, info.args[i]);
+        }
+        // Fill remaining with undefined
+        for (let i = actualArgs; i < maxArgs; i++) {
+          this._writeU32(argvPtr + i * 4, this.undefinedHandle);
         }
       }
     }
@@ -426,12 +496,10 @@ export class NapiRuntime {
   // Error handling
   napi_throw_error(args) {
     const [env, codePtr, msgPtr] = args;
-    const base = this._guestBase();
-    const mem = new Uint8Array(this.k.memory.buffer);
-    let end = msgPtr;
-    while (mem[base + end]) end++;
-    const msg = this._readString(msgPtr, end - msgPtr);
-    this.lastException = new Error(msg);
+    const code = codePtr ? this._readNullTermString(codePtr) : '';
+    const msg = msgPtr ? this._readNullTermString(msgPtr) : 'unknown error';
+    console.error(`  napi_throw_error: code='${code}' msg='${msg}'`);
+    this.lastException = new Error(`${code}: ${msg}`);
     this.exceptionPending = true;
     return napi_ok;
   }
@@ -478,14 +546,35 @@ export class NapiRuntime {
     return napi_ok;
   }
 
-  // Threadsafe functions (stubs for now)
+  // Threadsafe functions
   napi_create_threadsafe_function(args) {
     // args: env, func, asyncResource, asyncResourceName, maxQueueSize,
     //       initialThreadCount, threadFinalizeData, threadFinalizeCb,
     //       context, callJsCb, resultPtr
+    const funcHandle = args[1];
+    const context = args[8];
+    const callJsCb = args[9];
     const resultPtr = args[10];
-    const h = this._newHandle({ type: 'threadsafe_function' });
+
+    const tsf = {
+      type: 'threadsafe_function',
+      funcHandle,
+      context,
+      callJsCb,
+      queue: [],
+    };
+    const h = this._newHandle(tsf);
     this._writeResult(resultPtr, h);
+
+    // If there's a JS callback function, invoke it immediately
+    // This triggers napi-rs's module registration
+    if (funcHandle) {
+      const fn = this._getHandle(funcHandle);
+      if (typeof fn === 'function') {
+        try { fn(); } catch (e) { /* ignore */ }
+      }
+    }
+
     return napi_ok;
   }
 
@@ -497,7 +586,11 @@ export class NapiRuntime {
   dispatch(funcName, args) {
     const method = this[funcName];
     if (method) {
-      return BigInt(method.call(this, args));
+      const result = method.call(this, args);
+      if (this.debug) {
+        console.error(`  napi: ${funcName}(${args.join(',')}) -> ${result}`);
+      }
+      return BigInt(result);
     }
     console.error(`napi: unimplemented ${funcName}`);
     return BigInt(napi_generic_failure);

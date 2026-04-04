@@ -56,6 +56,24 @@ const loadResult = k.kernel_load(ptr, guestBytes.length);
 console.log("load:", loadResult);
 if (loadResult !== 0) process.exit(1);
 
+// WASI bridge functions
+const wasiFunctions = {
+  random_get(args) {
+    const [bufPtr, bufLen] = args;
+    const base = k.kernel_guest_memory_base();
+    const mem = new Uint8Array(k.memory.buffer);
+    for (let i = 0; i < bufLen; i++) {
+      mem[base + bufPtr + i] = (Math.random() * 256) | 0;
+    }
+    return 0n;
+  },
+  path_open() { return 44n; },    // ENOENT
+  fd_readdir() { return 8n; },    // BADF
+  fd_filestat_get() { return 8n; },
+  path_filestat_get() { return 44n; },
+  fd_prestat_dir_name() { return 8n; },
+};
+
 // Setup bridge
 const napiRuntime = new NapiRuntime(k);
 const bridgeCount = k.kernel_bridge_count();
@@ -74,11 +92,18 @@ for (let i = 0; i < bridgeCount; i++) {
   if (mod === "env" && napiRuntime[field]) {
     const fname = field;
     bridgeFunctions.set(i, (args) => napiRuntime.dispatch(fname, args));
+  } else if (mod === "wasi_snapshot_preview1" && wasiFunctions[field]) {
+    const fname = field;
+    bridgeFunctions.set(i, (args) => {
+      const r = wasiFunctions[fname](args);
+      return typeof r === 'bigint' ? r : BigInt(r ?? 0);
+    });
   } else {
     bridgeFunctions.set(i, () => 0n);
   }
 }
 
+napiRuntime.debug = true;
 console.log("guest memory base:", k.kernel_guest_memory_base());
 console.log("guest memory size:", (k.kernel_guest_memory_size() / 1024 / 1024).toFixed(1), "MB");
 
@@ -93,36 +118,41 @@ while (status === 0 && steps < MAX_STEPS) {
 console.log("_initialize:", status === 1 ? "OK" : `FAIL (status=${status})`);
 
 if (status === 1) {
-  // Call napi_register_wasm_v1(env, exports) to register oxide's Scanner
-  console.log("\nCalling napi_register_wasm_v1...");
+  // Helper to call a guest export by name
+  function callGuestExport(name, args) {
+    const fnNamePtr = k.kernel_alloc(name.length + 1);
+    const buf = new Uint8Array(k.memory.buffer, fnNamePtr, name.length + 1);
+    new TextEncoder().encodeInto(name, buf);
+    buf[name.length] = 0;
+    const argvPtr = k.kernel_alloc(args.length * 4);
+    const dv = new DataView(k.memory.buffer);
+    args.forEach((a, i) => dv.setUint32(argvPtr + i * 4, a, true));
+    const result = k.kernel_call(fnNamePtr, argvPtr, args.length);
+    const retVal = dv.getUint32(argvPtr, true);
+    return { result, retVal };
+  }
 
-  const envHandle = 1; // napi_env handle
+  // Step 1: Call __napi_register__Scanner_struct_4 and __napi_register__Scanner_impl_13
+  // These register the Scanner class descriptors in a global list inside the guest
+  console.log("\nRegistering Scanner descriptors...");
+  callGuestExport("__napi_register__Scanner_struct_4", []);
+  callGuestExport("__napi_register__Scanner_impl_13", []);
+
+  // Step 2: Call napi_register_module_v1(env, exports)
+  // This iterates the registered descriptors and calls napi_define_class etc.
+  console.log("Calling napi_register_module_v1...");
   const exportsObj = {};
   const exportsHandle = napiRuntime._newHandle(exportsObj);
 
-  // Write function name and args into kernel memory
-  const fnName = "napi_register_wasm_v1";
-  const fnNamePtr = k.kernel_alloc(fnName.length + 1);
-  const fnNameBuf = new Uint8Array(k.memory.buffer, fnNamePtr, fnName.length + 1);
-  new TextEncoder().encodeInto(fnName, fnNameBuf);
-  fnNameBuf[fnName.length] = 0;
+  const { result: regResult, retVal: returnedHandle } =
+    callGuestExport("napi_register_module_v1", [1, exportsHandle]);
+  console.log("napi_register_module_v1:", regResult === 0 ? "OK" : `FAIL(${regResult})`);
 
-  // Args: env (u32), exports (u32)
-  const argvPtr = k.kernel_alloc(8);
-  const argvDv = new DataView(k.memory.buffer);
-  argvDv.setUint32(argvPtr, envHandle, true);
-  argvDv.setUint32(argvPtr + 4, exportsHandle, true);
-
-  const callResult = k.kernel_call(fnNamePtr, argvPtr, 2);
-  console.log("napi_register_wasm_v1 result:", callResult);
-
-  if (callResult === 0) {
-    // Read return value (napi_value = handle to exports object)
-    const returnedHandle = argvDv.getUint32(argvPtr, true);
+  if (regResult === 0) {
     const returnedObj = napiRuntime._getHandle(returnedHandle);
-    console.log("returned handle:", returnedHandle);
-    console.log("exports object keys:", Object.keys(returnedObj ?? {}));
-    console.log("exports:", returnedObj);
+    console.log("exports handle:", returnedHandle);
+    console.log("exports keys:", Object.keys(returnedObj ?? exportsObj));
+    console.log("Scanner?", typeof (returnedObj ?? exportsObj)?.Scanner);
   }
 }
 

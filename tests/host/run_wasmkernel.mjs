@@ -68,15 +68,16 @@ const wasiFunctions = {
     return 8n; // BADF
   },
 
-  random_get(exec_args) {
+  random_get(args) {
     // args: buf_ptr(i32), buf_len(i32) -> i32
-    const [bufPtr, bufLen] = exec_args;
-    const mem = getKernelU8();
-    // Fill with pseudo-random bytes
+    // buf_ptr is a GUEST address — need to add guest memory base
+    const [bufPtr, bufLen] = args;
+    const base = k.kernel_guest_memory_base();
+    const mem = new Uint8Array(k.memory.buffer);
     for (let i = 0; i < bufLen; i++) {
-      mem[bufPtr + i] = (Math.random() * 256) | 0;
+      mem[base + bufPtr + i] = (Math.random() * 256) | 0;
     }
-    return 0n; // success
+    return 0n;
   },
 };
 
