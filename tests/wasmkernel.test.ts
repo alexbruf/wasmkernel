@@ -1,0 +1,115 @@
+/**
+ * WasmKernel Phase 1 test suite.
+ *
+ * Tests the kernel by loading guest .wasm modules and verifying
+ * return codes and output via subprocess execution.
+ */
+
+import { describe, test, expect } from "bun:test";
+import { readFileSync, statSync } from "fs";
+import { join, resolve } from "path";
+
+const ROOT = resolve(import.meta.dir, "..");
+const KERNEL_PATH = join(ROOT, "build", "wasmkernel.wasm");
+const GUEST_DIR = join(ROOT, "tests", "guest");
+const RUNNER = join(ROOT, "tests", "host", "run_wasmkernel.mjs");
+
+/**
+ * Run a guest wasm inside wasmkernel via subprocess.
+ * Returns { exitCode, stdout, stderr }.
+ */
+async function runGuest(guestName: string) {
+  const guestPath = join(GUEST_DIR, guestName);
+  const proc = Bun.spawn(
+    ["node", "--experimental-wasi-unstable-preview1", RUNNER, guestPath],
+    { stdout: "pipe", stderr: "pipe" }
+  );
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  const exitCode = await proc.exited;
+  return { exitCode, stdout: stdout.trim(), stderr: stderr.trim() };
+}
+
+/** Parse "status: N, exitCode: M" from stderr */
+function parseStatus(stderr: string) {
+  const match = stderr.match(/status: (-?\d+), exitCode: (\d+)/);
+  return match
+    ? { status: parseInt(match[1]), exitCode: parseInt(match[2]) }
+    : null;
+}
+
+describe("Phase 1: build", () => {
+  test("wasmkernel.wasm exists and is valid", () => {
+    const stat = statSync(KERNEL_PATH);
+    expect(stat.size).toBeGreaterThan(0);
+  });
+
+  test("binary size under 400KB", () => {
+    const stat = statSync(KERNEL_PATH);
+    expect(stat.size).toBeLessThan(400 * 1024);
+  });
+});
+
+describe("Phase 1: guest execution", () => {
+  test("hello world", async () => {
+    const result = await runGuest("hello.wasm");
+    expect(result.stdout).toBe("hello world");
+    const s = parseStatus(result.stderr);
+    expect(s?.status).toBe(1);
+  });
+
+  test("exit code propagation", async () => {
+    const result = await runGuest("exit42.wasm");
+    const s = parseStatus(result.stderr);
+    expect(s?.status).toBe(-2); // proc_exit
+    expect(s?.exitCode).toBe(42);
+    expect(result.exitCode).toBe(42);
+  });
+
+  test("trap handling", async () => {
+    const result = await runGuest("trap.wasm");
+    const s = parseStatus(result.stderr);
+    expect(s?.status).toBe(-1);
+    expect(result.exitCode).toBe(1);
+  });
+
+  test("memory allocation", async () => {
+    const result = await runGuest("alloc.wasm");
+    expect(result.stdout).toBe("alloc ok: 65536 bytes");
+    const s = parseStatus(result.stderr);
+    expect(s?.status).toBe(1);
+  });
+
+  test("invalid module", async () => {
+    // Try loading garbage bytes — the runner should exit 1
+    const result = await runGuest("hello.c"); // .c file is not valid wasm
+    expect(result.exitCode).not.toBe(0);
+  });
+});
+
+describe("Phase 2: cooperative threading", () => {
+  test("thread spawn and atomic wait/notify", async () => {
+    const result = await runGuest("thread_raw.wasm");
+    expect(result.stdout).toContain("thread_raw ok");
+    expect(result.stdout).toContain("tid=1");
+    expect(result.stdout).toContain("value=142");
+    const s = parseStatus(result.stderr);
+    expect(s?.status).toBe(1);
+  });
+
+  test("mutex-protected shared counter (4 threads x 100)", async () => {
+    const result = await runGuest("mutex_counter.wasm");
+    expect(result.stdout).toBe("mutex_counter ok: 400");
+    const s = parseStatus(result.stderr);
+    expect(s?.status).toBe(1);
+  });
+
+  test("spawn 8 threads with unique TIDs", async () => {
+    const result = await runGuest("many_threads.wasm");
+    expect(result.stdout).toContain("many_threads ok: 8 threads");
+    const s = parseStatus(result.stderr);
+    expect(s?.status).toBe(1);
+  });
+});

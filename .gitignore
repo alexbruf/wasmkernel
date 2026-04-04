@@ -1,0 +1,8 @@
+build/
+.env
+.env.*
+.claude/
+node_modules/
+*.wasm
+.playwright-mcp/
+!tests/guest/*.c

@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WasmKernel - Cooperative Threading in the Browser</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'SF Mono', 'Fira Code', monospace; background: #0d1117; color: #c9d1d9; padding: 2rem; }
+    h1 { color: #58a6ff; margin-bottom: 0.5rem; font-size: 1.4rem; }
+    .subtitle { color: #8b949e; margin-bottom: 2rem; font-size: 0.85rem; }
+    .controls { display: flex; gap: 0.75rem; margin-bottom: 1.5rem; flex-wrap: wrap; }
+    button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; font-family: inherit; font-size: 0.85rem; }
+    button:hover { background: #30363d; border-color: #58a6ff; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    button.active { background: #1f6feb; border-color: #58a6ff; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 0.75rem; margin-bottom: 1.5rem; }
+    .stat { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 0.75rem; }
+    .stat-label { color: #8b949e; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    .stat-value { color: #58a6ff; font-size: 1.3rem; font-weight: bold; margin-top: 0.25rem; }
+    #output { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 1rem; min-height: 300px; max-height: 500px; overflow-y: auto; white-space: pre-wrap; font-size: 0.8rem; line-height: 1.5; }
+    .log-info { color: #8b949e; }
+    .log-stdout { color: #c9d1d9; }
+    .log-ok { color: #3fb950; }
+    .log-err { color: #f85149; }
+    .log-thread { color: #d2a8ff; }
+  </style>
+</head>
+<body>
+  <h1>WasmKernel</h1>
+  <p class="subtitle">Cooperative wasi-threads on a single browser thread. No SharedArrayBuffer. No Web Workers. No COOP/COEP.</p>
+
+  <div class="controls">
+    <button id="btn-parallel-sum" onclick="runGuest('parallel_sum')">Parallel Sum (4 threads)</button>
+    <button id="btn-mutex" onclick="runGuest('mutex_counter')">Mutex Counter (4 threads)</button>
+    <button id="btn-many" onclick="runGuest('many_threads')">Many Threads (8)</button>
+    <button id="btn-thread-raw" onclick="runGuest('thread_raw')">Basic Thread Spawn</button>
+    <button id="btn-hello" onclick="runGuest('hello')">Hello World</button>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="stat-label">Kernel Size</div><div class="stat-value" id="stat-size">-</div></div>
+    <div class="stat"><div class="stat-label">Scheduler Steps</div><div class="stat-value" id="stat-steps">-</div></div>
+    <div class="stat"><div class="stat-label">Time</div><div class="stat-value" id="stat-time">-</div></div>
+    <div class="stat"><div class="stat-label">Status</div><div class="stat-value" id="stat-status">Ready</div></div>
+  </div>
+
+  <div id="output"></div>
+
+  <script type="module">
+    import { WASI, File, OpenFile, ConsoleStdout } from "./node_modules/@bjorn3/browser_wasi_shim/dist/index.js";
+
+    const output = document.getElementById("output");
+    const statSize = document.getElementById("stat-size");
+    const statSteps = document.getElementById("stat-steps");
+    const statTime = document.getElementById("stat-time");
+    const statStatus = document.getElementById("stat-status");
+
+    let running = false;
+
+    function log(msg, cls = "log-info") {
+      const span = document.createElement("span");
+      span.className = cls;
+      span.textContent = msg + "\n";
+      output.appendChild(span);
+      output.scrollTop = output.scrollHeight;
+    }
+
+    function setButtons(disabled) {
+      document.querySelectorAll(".controls button").forEach(b => b.disabled = disabled);
+    }
+
+    // Capture stdout/stderr from the kernel's fd_write
+    function createWasi() {
+      return new WASI(
+        [], // args
+        [], // env
+        [
+          new OpenFile(new File([])), // stdin
+          ConsoleStdout.lineBuffered(msg => log(msg, "log-stdout")),
+          ConsoleStdout.lineBuffered(msg => log(msg, "log-stdout")),
+        ]
+      );
+    }
+
+    async function runGuest(name) {
+      if (running) return;
+      running = true;
+      setButtons(true);
+      output.innerHTML = "";
+      statSteps.textContent = "-";
+      statTime.textContent = "-";
+      statStatus.textContent = "Loading...";
+
+      try {
+        log(`Loading wasmkernel.wasm...`);
+        const kernelResp = await fetch("../build/wasmkernel.wasm");
+        const kernelBytes = new Uint8Array(await kernelResp.arrayBuffer());
+        statSize.textContent = (kernelBytes.length / 1024).toFixed(0) + " KB";
+
+        log(`Loading guest: ${name}.wasm...`);
+        const guestResp = await fetch(`../tests/guest/${name}.wasm`);
+        const guestBytes = new Uint8Array(await guestResp.arrayBuffer());
+        log(`Guest size: ${(guestBytes.length / 1024).toFixed(0)} KB`);
+
+        // Create WASI and instantiate kernel
+        const wasi = createWasi();
+        const compiled = await WebAssembly.compile(kernelBytes);
+        const instance = await WebAssembly.instantiate(compiled, {
+          wasi_snapshot_preview1: wasi.wasiImport,
+        });
+        wasi.initialize(instance);
+
+        const k = instance.exports;
+        log(`Kernel initialized.`);
+
+        // Initialize and load guest
+        k.kernel_init();
+        const ptr = k.kernel_alloc(guestBytes.length);
+        const mem = new Uint8Array(k.memory.buffer);
+        mem.set(guestBytes, ptr);
+
+        const loadResult = k.kernel_load(ptr, guestBytes.length);
+        if (loadResult !== 0) {
+          log(`kernel_load failed: ${loadResult}`, "log-err");
+          statStatus.textContent = "Load Error";
+          return;
+        }
+        log(`Guest loaded. Running scheduler...`, "log-thread");
+
+        // Run scheduler loop
+        statStatus.textContent = "Running";
+        const t0 = performance.now();
+        let steps = 0;
+        const MAX_STEPS = 2_000_000;
+
+        // Use requestAnimationFrame batching for UI responsiveness
+        await new Promise((resolve) => {
+          function tick() {
+            const batchSize = 10000;
+            for (let i = 0; i < batchSize && steps < MAX_STEPS; i++) {
+              const status = k.kernel_step();
+              steps++;
+              if (status !== 0) {
+                const elapsed = performance.now() - t0;
+                statSteps.textContent = steps.toLocaleString();
+                statTime.textContent = elapsed.toFixed(1) + " ms";
+
+                if (status === 1) {
+                  log(`\nAll threads exited normally.`, "log-ok");
+                  statStatus.textContent = "Done";
+                } else if (status === -2) {
+                  const code = k.kernel_exit_code();
+                  if (code === 0) {
+                    log(`\nGuest exited with code 0.`, "log-ok");
+                    statStatus.textContent = "Done";
+                  } else {
+                    log(`\nGuest exited with code ${code}.`, "log-err");
+                    statStatus.textContent = `Exit(${code})`;
+                  }
+                } else {
+                  log(`\nGuest trapped (status=${status}).`, "log-err");
+                  statStatus.textContent = "Trap";
+                }
+                resolve();
+                return;
+              }
+            }
+            statSteps.textContent = steps.toLocaleString();
+            if (steps >= MAX_STEPS) {
+              log(`\nTimeout: scheduler did not complete in ${MAX_STEPS} steps.`, "log-err");
+              statStatus.textContent = "Timeout";
+              resolve();
+            } else {
+              requestAnimationFrame(tick);
+            }
+          }
+          requestAnimationFrame(tick);
+        });
+
+      } catch (e) {
+        log(`Error: ${e.message}`, "log-err");
+        statStatus.textContent = "Error";
+        console.error(e);
+      } finally {
+        running = false;
+        setButtons(false);
+      }
+    }
+
+    // Expose to onclick handlers
+    window.runGuest = runGuest;
+    log("Ready. Click a button to run a guest program.");
+  </script>
+</body>
+</html>
