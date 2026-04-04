@@ -291,11 +291,13 @@ wasmkernel_scheduler_step(void)
         if (thread->start_routine) {
             thread->start_routine(thread->exec_env);
         } else {
-            /* Main thread: look up and call _start */
+            /* Main thread: look up entry point */
             wasm_module_inst_t inst = wasm_runtime_get_module_inst(
                 thread->exec_env);
             wasm_function_inst_t start_func =
                 wasm_runtime_lookup_function(inst, "_start");
+            if (!start_func)
+                start_func = wasm_runtime_lookup_function(inst, "_initialize");
             if (start_func) {
                 wasm_runtime_call_wasm(thread->exec_env, start_func, 0, NULL);
             } else {

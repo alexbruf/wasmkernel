@@ -9,10 +9,9 @@
  * and dispatches to real implementations (WASI fs ops, N-API, etc).
  */
 
-import { readFileSync, openSync, readSync, closeSync, fstatSync,
-         readdirSync, statSync } from "fs";
+import { readFileSync } from "fs";
 import { WASI } from "wasi";
-import { resolve } from "path";
+import { NapiRuntime } from "./napi_runtime.mjs";
 
 const kernelPath = new URL("../../build/wasmkernel.wasm", import.meta.url)
   .pathname;
@@ -38,22 +37,6 @@ const bridgeFunctions = new Map(); // funcIdx -> handler function
 
 /* ===== Host I/O bridge ===== */
 const pendingIO = new Map();
-
-/* ===== WASI filesystem state ===== */
-// fd 0=stdin, 1=stdout, 2=stderr are handled by the kernel.
-// fd 3+ are for files opened via path_open.
-let nextFd = 3;
-const openFds = new Map(); // fd -> { hostFd, path }
-const preopenDirs = new Map(); // fd -> path (for fd_prestat_get)
-// No preopens by default in test mode
-
-function getKernelMemory() {
-  return new DataView(k.memory.buffer);
-}
-
-function getKernelU8() {
-  return new Uint8Array(k.memory.buffer);
-}
 
 /* ===== WASI function implementations for bridge ===== */
 const wasiFunctions = {
@@ -164,6 +147,7 @@ if (loadResult !== 0) {
 }
 
 /* ===== Discover bridge mappings ===== */
+const napiRuntime = new NapiRuntime(k);
 const bridgeCount = k.kernel_bridge_count();
 if (bridgeCount > 0) {
   const infoBuf = k.kernel_alloc(256);
@@ -180,14 +164,16 @@ if (bridgeCount > 0) {
         start = j + 1;
       }
     }
-    const [moduleName, fieldName, signature] = parts;
+    const [moduleName, fieldName] = parts;
 
-    // Register handler based on module + field
     if (moduleName === "wasi_snapshot_preview1" && wasiFunctions[fieldName]) {
       bridgeFunctions.set(i, wasiFunctions[fieldName]);
+    } else if (moduleName === "env" && napiRuntime[fieldName]) {
+      // N-API function — dispatch to our napi runtime
+      const fname = fieldName;
+      bridgeFunctions.set(i, (args) => napiRuntime.dispatch(fname, args));
     } else {
-      // Unknown bridge function — log and return 0
-      console.error(`bridge[${i}]: ${moduleName}.${fieldName} ${signature} (unimplemented)`);
+      console.error(`bridge[${i}]: ${moduleName}.${fieldName} (unimplemented)`);
       bridgeFunctions.set(i, () => 0n);
     }
   }
