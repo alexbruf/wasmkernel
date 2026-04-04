@@ -156,7 +156,8 @@ register_bridge_imports(wasm_module_t module,
                         NativeSymbol *wasi_syms, uint32_t num_wasi_syms)
 {
     WASMModule *m = (WASMModule *)module;
-    g_bridge_count = 0;
+    /* Don't reset g_bridge_count — preserve pre-registered entries from kernel_init */
+    uint32_t bridge_start = g_bridge_count;
 
     /* Collect imports that need bridging — skip only functions
        the kernel handles internally */
@@ -190,11 +191,11 @@ register_bridge_imports(wasm_module_t module,
     }
 
     /* Register bridge natives grouped by module name */
-    if (g_bridge_count == 0)
+    if (g_bridge_count == bridge_start)
         return;
 
     /* We need to register per-module. Group by module name. */
-    for (uint32_t i = 0; i < g_bridge_count; i++) {
+    for (uint32_t i = bridge_start; i < g_bridge_count; i++) {
         /* Check if this module was already registered */
         bool already = false;
         for (uint32_t j = 0; j < i; j++) {
@@ -624,7 +625,11 @@ kernel_init(void)
         return;
     }
 
-    /* Pre-register env.napi functions for modules that import them */
+    /* Pre-register env.napi functions for modules that import them.
+     * IMPORTANT: This table is already sorted alphabetically because
+     * WAMR's register_natives sorts it and uses binary search. The bridge
+     * slot (bfn_N) index matches the sorted position, so the host's
+     * bridge discovery (kernel_bridge_info) returns them in the same order. */
     {
         static NativeSymbol env_napi[] = {
             { "napi_call_function",              (void *)bfn_0,  "(iiiiii)i", NULL },
@@ -665,8 +670,41 @@ kernel_init(void)
             { "napi_unwrap",                     (void *)bfn_35, "(iii)i",    NULL },
             { "napi_wrap",                       (void *)bfn_36, "(iiiiii)i", NULL },
         };
-        if (!wasm_runtime_register_natives_raw("env", env_napi,
-                sizeof(env_napi) / sizeof(NativeSymbol))) {
+        /* Also populate bridge metadata so host can discover these via
+           kernel_bridge_info. Use same indices as bfn_N. */
+        static const char *env_names[] = {
+            "napi_call_function", "napi_coerce_to_object", "napi_coerce_to_string",
+            "napi_create_array_with_length", "napi_create_error", "napi_create_function",
+            "napi_create_int64", "napi_create_object", "napi_create_reference",
+            "napi_create_string_utf8", "napi_create_threadsafe_function",
+            "napi_define_class", "napi_delete_reference",
+            "napi_get_and_clear_last_exception", "napi_get_array_length",
+            "napi_get_cb_info", "napi_get_element", "napi_get_global",
+            "napi_get_named_property", "napi_get_property", "napi_get_reference_value",
+            "napi_get_undefined", "napi_get_value_bool", "napi_get_value_string_utf8",
+            "napi_is_array", "napi_is_error", "napi_is_exception_pending",
+            "napi_reference_unref", "napi_set_element", "napi_set_named_property",
+            "napi_set_property", "napi_throw", "napi_throw_error", "napi_typeof",
+            "napi_unref_threadsafe_function", "napi_unwrap", "napi_wrap",
+        };
+        uint32_t n_env = sizeof(env_napi) / sizeof(NativeSymbol);
+        for (uint32_t i = 0; i < n_env; i++) {
+            strncpy(g_bridge_module_names[i], "env", 63);
+            strncpy(g_bridge_field_names[i], env_names[i], 63);
+            /* Parse param count from signature string */
+            const char *sig = env_napi[i].signature;
+            uint32_t pc = 0;
+            if (sig) {
+                const char *p = sig;
+                if (*p == '(') p++;
+                while (*p && *p != ')') { pc++; p++; }
+            }
+            g_bridge_param_counts[i] = pc;
+            g_bridge_has_return[i] = true;
+        }
+        g_bridge_count = n_env; /* 37 */
+
+        if (!wasm_runtime_register_natives_raw("env", env_napi, n_env)) {
             fprintf(stderr, "kernel_init: failed to register env.napi\n");
         }
     }
@@ -710,8 +748,13 @@ kernel_load(uint32_t wasm_ptr, uint32_t wasm_len)
         return -2;
     }
 
-    /* Pre-register bridge metadata for WASI filesystem stubs (slots 120-127)
-       so the host can discover them via kernel_bridge_info */
+    /* Scan guest imports and register bridge handlers for any
+       import the kernel doesn't handle internally */
+    register_bridge_imports(g_guest_module, g_wasi_symbols, NUM_WASI_SYMBOLS);
+
+    /* Register bridge metadata for WASI filesystem stubs (slots 120-127)
+       so the host can discover them via kernel_bridge_info.
+       Must be AFTER register_bridge_imports which resets g_bridge_count. */
     {
         static const struct { uint32_t slot; const char *name; } wasi_bridge[] = {
             { 120, "path_open" },
@@ -725,15 +768,11 @@ kernel_load(uint32_t wasm_ptr, uint32_t wasm_len)
             uint32_t s = wasi_bridge[i].slot;
             strncpy(g_bridge_module_names[s], "wasi_snapshot_preview1", 63);
             strncpy(g_bridge_field_names[s], wasi_bridge[i].name, 63);
-            g_bridge_param_counts[s] = 2; /* generic */
+            g_bridge_param_counts[s] = 2;
             g_bridge_has_return[s] = true;
             if (s >= g_bridge_count) g_bridge_count = s + 1;
         }
     }
-
-    /* Scan guest imports and register bridge handlers for any
-       import the kernel doesn't handle internally */
-    register_bridge_imports(g_guest_module, g_wasi_symbols, NUM_WASI_SYMBOLS);
 
     /* Cap guest max memory on wasm32 — we can't allocate 4GB inside
        the kernel's own 4GB address space. 256MB is generous. */

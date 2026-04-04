@@ -566,14 +566,7 @@ export class NapiRuntime {
     const h = this._newHandle(tsf);
     this._writeResult(resultPtr, h);
 
-    // If there's a JS callback function, invoke it immediately
-    // This triggers napi-rs's module registration
-    if (funcHandle) {
-      const fn = this._getHandle(funcHandle);
-      if (typeof fn === 'function') {
-        try { fn(); } catch (e) { /* ignore */ }
-      }
-    }
+    // Don't auto-invoke — napi-rs handles this internally
 
     return napi_ok;
   }
