@@ -35,6 +35,8 @@
     <button id="btn-mutex" onclick="runGuest('mutex_counter')">Mutex Counter (4 threads)</button>
     <button id="btn-many" onclick="runGuest('many_threads')">Many Threads (8)</button>
     <button id="btn-thread-raw" onclick="runGuest('thread_raw')">Basic Thread Spawn</button>
+    <button id="btn-sleep-compute" onclick="runGuest('sleep_and_compute')">Sleep + Compute</button>
+    <button id="btn-poll-sleep" onclick="runGuest('poll_sleep')">Poll Sleep</button>
     <button id="btn-hello" onclick="runGuest('hello')">Hello World</button>
   </div>
 
@@ -103,11 +105,36 @@
         const guestBytes = new Uint8Array(await guestResp.arrayBuffer());
         log(`Guest size: ${(guestBytes.length / 1024).toFixed(0)} KB`);
 
+        // Host I/O bridge
+        const pendingIO = new Map();
+        const hostImports = {
+          host_io_submit(callbackId, opType, fd, bufPtr, len) {
+            if (opType === 1) {
+              pendingIO.set(callbackId, { bytes: 0, error: 0 }); // EOF
+            } else if (opType === 2) {
+              pendingIO.set(callbackId, { bytes: len, error: 0 });
+            }
+          },
+          host_io_check(callbackId) {
+            return pendingIO.has(callbackId) ? 1 : 0;
+          },
+          host_io_result_bytes(callbackId) {
+            const r = pendingIO.get(callbackId);
+            return r ? r.bytes : 0;
+          },
+          host_io_result_error(callbackId) {
+            const r = pendingIO.get(callbackId);
+            if (r) pendingIO.delete(callbackId);
+            return r ? r.error : 8;
+          },
+        };
+
         // Create WASI and instantiate kernel
         const wasi = createWasi();
         const compiled = await WebAssembly.compile(kernelBytes);
         const instance = await WebAssembly.instantiate(compiled, {
           wasi_snapshot_preview1: wasi.wasiImport,
+          host: hostImports,
         });
         wasi.initialize(instance);
 

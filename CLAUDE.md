@@ -40,4 +40,6 @@ Or use the build script: `./scripts/build.sh`
 - WAMR native functions use the **raw API** (`wasm_runtime_register_natives_raw`) because the regular API uses function pointers that become `call_indirect` in wasm32, causing type mismatches.
 - Build as a **reactor** (`-mexec-model=reactor`) so the host can call individual exports.
 - WASI passthrough is minimal (fd_write to stdout/stderr, proc_exit, args/environ stubs).
-- Phase 1 runs guest `_start` to completion in one shot (no cooperative scheduling yet).
+- Phase 2 added cooperative scheduling: fuel-based preemption, wasi-threads thread-spawn, atomic wait/notify.
+- Phase 3 added I/O bridge: host_io_* imports for async fd_read, poll_oneoff with clock subscriptions, sched_yield.
+- The kernel imports `host_io_submit/check/result_bytes/result_error` from a `host` module at instantiation time.

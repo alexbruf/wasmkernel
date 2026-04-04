@@ -28,6 +28,13 @@ typedef enum {
     THREAD_EXITED
 } WasmKernelThreadState;
 
+/* I/O operation types */
+#define IO_OP_NONE        0
+#define IO_OP_READ        1
+#define IO_OP_WRITE       2
+#define IO_OP_POLL_CLOCK  3  /* internal timer, no host involvement */
+#define IO_OP_POLL_FD     4  /* fd readiness check via host */
+
 typedef struct WasmKernelThread {
     wasm_exec_env_t exec_env;
     int32_t tid;
@@ -42,6 +49,16 @@ typedef struct WasmKernelThread {
     /* Thread start info */
     void *(*start_routine)(void *);
     void *start_arg;
+
+    /* For async I/O (THREAD_BLOCKED_IO) */
+    uint32_t io_callback_id;
+    uint32_t io_op_type;       /* IO_OP_* */
+    uint64_t io_deadline_us;   /* for poll_oneoff clock */
+    uint32_t io_result_ptr;    /* guest-memory ptr to write nread/nwritten */
+    uint32_t io_event_out_ptr; /* guest-memory ptr for poll_oneoff events */
+    uint32_t io_nevents_ptr;   /* guest-memory ptr for poll_oneoff nevents */
+    uint64_t io_userdata;      /* poll_oneoff userdata to echo back */
+    int32_t  io_wasi_errno;    /* WASI errno to return when unblocked */
 } WasmKernelThread;
 
 typedef struct WasmKernelScheduler {
@@ -50,6 +67,7 @@ typedef struct WasmKernelScheduler {
     uint32_t current;          /* round-robin index */
     uint32_t fuel_per_slice;
     int32_t next_tid;
+    uint32_t next_callback_id; /* for async I/O */
     bool has_trap;
     int32_t exit_code;
     bool exited_via_proc_exit;
@@ -86,6 +104,19 @@ wasmkernel_scheduler_block_on_wait(wasm_exec_env_t exec_env,
 /* Wake threads blocked on an address. Returns number woken. */
 uint32_t
 wasmkernel_scheduler_wake_waiters(void *addr, uint32_t count);
+
+/* Block the current thread on async I/O. Returns callback_id. */
+uint32_t
+wasmkernel_scheduler_block_on_io(wasm_exec_env_t exec_env,
+                                  uint32_t op_type, uint32_t result_ptr);
+
+/* Block the current thread on poll_oneoff clock timeout. */
+void
+wasmkernel_scheduler_block_on_poll_clock(wasm_exec_env_t exec_env,
+                                          uint64_t deadline_us,
+                                          uint32_t event_out_ptr,
+                                          uint32_t nevents_ptr,
+                                          uint64_t userdata);
 
 /* Check if a thread is in yield state (called from atomic wait/notify
    to determine if we should yield back to scheduler) */

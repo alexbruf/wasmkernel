@@ -11,6 +11,9 @@
 #include "wasm_export.h"
 #include "scheduler.h"
 
+#include "wasm_exec_env.h"
+#include "wasm_suspend_flags.h"
+
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -26,6 +29,11 @@ static wasm_exec_env_t g_guest_exec_env = NULL;
 static int32_t g_exit_code = 0;
 static bool g_exited_via_proc_exit = false;
 static char g_error_buf[256];
+
+/* ===== Host I/O bridge imports ===== */
+__attribute__((import_module("host"), import_name("host_io_submit")))
+extern void host_io_submit(uint32_t callback_id, uint32_t op_type,
+                            uint32_t fd, uint32_t buf_ptr, uint32_t len);
 
 /* ===== Minimal WASI passthrough (raw native API) ===== */
 /*
@@ -69,13 +77,54 @@ wasi_fd_write(wasm_exec_env_t exec_env, uint64 *args)
     native_raw_set_return(0);
 }
 
-/* fd_read -> BADF */
+/* fd_read(fd: i32, iovs: i32, iovs_len: i32, nread: i32) -> i32
+ * For stdin/real fds: submit async I/O to host, block thread.
+ * Returns BADF for unknown fds until host has them open. */
 static void
 wasi_fd_read(wasm_exec_env_t exec_env, uint64 *args)
 {
     native_raw_return_type(uint32, args);
-    (void)exec_env;
-    native_raw_set_return(8);
+    wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
+    native_raw_get_arg(int32, fd, args);
+    native_raw_get_arg(uint32, iovs_offset, args);
+    native_raw_get_arg(uint32, iovs_len, args);
+    native_raw_get_arg(uint32, nread_offset, args);
+
+    /* Resolve iov list */
+    uint32_t *iovs = (uint32_t *)wasm_runtime_addr_app_to_native(
+        inst, (uint64_t)iovs_offset);
+    if (!iovs) { native_raw_set_return(8); return; }
+
+    /* Gather total length and first buffer pointer */
+    uint32_t total_len = 0;
+    uint32_t first_buf_ptr = 0;
+    for (uint32_t i = 0; i < iovs_len; i++) {
+        if (i == 0) first_buf_ptr = iovs[i * 2];
+        total_len += iovs[i * 2 + 1];
+    }
+    if (total_len == 0) {
+        uint32_t *nr = (uint32_t *)wasm_runtime_addr_app_to_native(
+            inst, (uint64_t)nread_offset);
+        if (nr) *nr = 0;
+        native_raw_set_return(0);
+        return;
+    }
+
+    /* Resolve first buffer to a kernel-memory address (offset) for host */
+    char *buf = (char *)wasm_runtime_addr_app_to_native(
+        inst, (uint64_t)first_buf_ptr);
+    if (!buf) { native_raw_set_return(8); return; }
+    uint32_t buf_kernel_offset = (uint32_t)(uintptr_t)buf;
+
+    /* Submit async read to host, block this thread */
+    uint32_t cb_id = wasmkernel_scheduler_block_on_io(
+        exec_env, IO_OP_READ, nread_offset);
+    host_io_submit(cb_id, IO_OP_READ, (uint32_t)fd,
+                   buf_kernel_offset, total_len);
+
+    /* Return value will be set when thread resumes after I/O completes.
+     * The scheduler writes nread and sets io_wasi_errno. */
+    native_raw_set_return(0);
 }
 
 /* fd_seek -> BADF */
@@ -215,6 +264,101 @@ wasi_clock_time_get(wasm_exec_env_t exec_env, uint64 *args)
     native_raw_set_return(0);
 }
 
+/* poll_oneoff(in: i32, out: i32, nsubscriptions: i32, nevents: i32) -> i32
+ *
+ * Subscription struct (48 bytes):
+ *   userdata: u64 (offset 0)
+ *   u.tag: u8 (offset 8) — 0=clock, 1=fd_read, 2=fd_write
+ *   u.clock.id: u32 (offset 16)
+ *   u.clock.timeout: u64 (offset 24)
+ *   u.clock.precision: u64 (offset 32)
+ *   u.clock.flags: u16 (offset 40) — bit 0: ABSTIME
+ *
+ * Event struct (32 bytes):
+ *   userdata: u64 (offset 0)
+ *   error: u16 (offset 8)
+ *   type: u8 (offset 10)
+ *   pad: 5 bytes
+ *   fd_readwrite.nbytes: u64 (offset 16)
+ *   fd_readwrite.flags: u16 (offset 24)
+ */
+static void
+wasi_poll_oneoff(wasm_exec_env_t exec_env, uint64 *args)
+{
+    native_raw_return_type(uint32, args);
+    wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
+    native_raw_get_arg(uint32, in_ptr, args);
+    native_raw_get_arg(uint32, out_ptr, args);
+    native_raw_get_arg(uint32, nsubs, args);
+    native_raw_get_arg(uint32, nevents_ptr, args);
+
+    uint8_t *subs = (uint8_t *)wasm_runtime_addr_app_to_native(
+        inst, (uint64_t)in_ptr);
+    if (!subs || nsubs == 0) { native_raw_set_return(28); return; }
+
+    /* For now, handle single-subscription clock case (covers nanosleep).
+     * Multi-subscription and fd subscriptions can be added later. */
+    uint8_t tag = subs[8]; /* u.tag */
+
+    if (tag == 0) {
+        /* Clock subscription */
+        uint64_t timeout_ns;
+        memcpy(&timeout_ns, subs + 24, 8);
+        uint16_t flags;
+        memcpy(&flags, subs + 40, 2);
+        uint64_t userdata;
+        memcpy(&userdata, subs + 0, 8);
+
+        uint64_t now_us = 0;
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        now_us = (uint64_t)ts.tv_sec * 1000000ULL
+               + (uint64_t)ts.tv_nsec / 1000;
+
+        uint64_t deadline_us;
+        if (flags & 1) {
+            /* ABSTIME: timeout is absolute timestamp in nanoseconds */
+            deadline_us = timeout_ns / 1000;
+        } else {
+            /* Relative timeout */
+            deadline_us = now_us + timeout_ns / 1000;
+        }
+
+        /* Block this thread until deadline */
+        wasmkernel_scheduler_block_on_poll_clock(
+            exec_env, deadline_us, out_ptr, nevents_ptr, userdata);
+        native_raw_set_return(0);
+    } else if (tag == 1 || tag == 2) {
+        /* fd_read/fd_write subscription — immediate ready for stdout/stderr */
+        uint8_t *evt = (uint8_t *)wasm_runtime_addr_app_to_native(
+            inst, (uint64_t)out_ptr);
+        uint32_t *nev = (uint32_t *)wasm_runtime_addr_app_to_native(
+            inst, (uint64_t)nevents_ptr);
+        if (evt) {
+            uint64_t userdata;
+            memcpy(&userdata, subs + 0, 8);
+            memset(evt, 0, 32);
+            memcpy(evt, &userdata, 8);
+            evt[10] = tag; /* type */
+        }
+        if (nev) *nev = 1;
+        native_raw_set_return(0);
+    } else {
+        native_raw_set_return(28); /* INVAL */
+    }
+}
+
+/* sched_yield -> yield to scheduler */
+static void
+wasi_sched_yield(wasm_exec_env_t exec_env, uint64 *args)
+{
+    native_raw_return_type(uint32, args);
+    /* Set yield flag so the thread gives up its time slice */
+    WASM_SUSPEND_FLAGS_FETCH_OR(exec_env->suspend_flags,
+                                WASM_SUSPEND_FLAG_YIELD);
+    native_raw_set_return(0);
+}
+
 static NativeSymbol g_wasi_symbols[] = {
     { "fd_write",           (void *)wasi_fd_write,           "(iiii)i",  NULL },
     { "fd_read",            (void *)wasi_fd_read,            "(iiii)i",  NULL },
@@ -228,7 +372,8 @@ static NativeSymbol g_wasi_symbols[] = {
     { "args_sizes_get",     (void *)wasi_args_sizes_get,     "(ii)i",    NULL },
     { "args_get",           (void *)wasi_args_get,           "(ii)i",    NULL },
     { "clock_time_get",     (void *)wasi_clock_time_get,     "(iIi)i",   NULL },
-    { "sched_yield",        (void *)wasi_environ_get,        "()i",      NULL },
+    { "poll_oneoff",        (void *)wasi_poll_oneoff,        "(iiii)i",  NULL },
+    { "sched_yield",        (void *)wasi_sched_yield,        "()i",      NULL },
 };
 
 #define NUM_WASI_SYMBOLS (sizeof(g_wasi_symbols) / sizeof(NativeSymbol))

@@ -109,6 +109,16 @@ wasmkernel_scheduler_wake_waiters(void *addr, uint32_t count)
     return woken;
 }
 
+/* Host I/O bridge imports */
+__attribute__((import_module("host"), import_name("host_io_check")))
+extern uint32_t host_io_check(uint32_t callback_id);
+
+__attribute__((import_module("host"), import_name("host_io_result_bytes")))
+extern uint32_t host_io_result_bytes(uint32_t callback_id);
+
+__attribute__((import_module("host"), import_name("host_io_result_error")))
+extern uint32_t host_io_result_error(uint32_t callback_id);
+
 /* Check wait timeouts */
 static void
 check_wait_timeouts(void)
@@ -122,6 +132,61 @@ check_wait_timeouts(void)
             if (elapsed >= (uint64_t)t->wait_timeout_us) {
                 t->state = THREAD_READY;
                 t->wait_address = NULL;
+            }
+        }
+    }
+}
+
+/* Check I/O completions */
+static void
+check_io_completions(void)
+{
+    uint64_t now = get_time_us();
+
+    for (uint32_t i = 0; i < g_scheduler.num_threads; i++) {
+        WasmKernelThread *t = &g_scheduler.threads[i];
+        if (t->state != THREAD_BLOCKED_IO)
+            continue;
+
+        if (t->io_op_type == IO_OP_POLL_CLOCK) {
+            /* Internal timer — check deadline */
+            if (now >= t->io_deadline_us) {
+                /* Write poll_oneoff event to guest memory */
+                if (t->io_event_out_ptr && t->exec_env) {
+                    wasm_module_inst_t inst =
+                        wasm_runtime_get_module_inst(t->exec_env);
+                    /* event struct: userdata(8) + error(2) + type(1) + pad(5) + fd_readwrite(16) = 32 bytes */
+                    uint8_t *evt = (uint8_t *)wasm_runtime_addr_app_to_native(
+                        inst, (uint64_t)t->io_event_out_ptr);
+                    if (evt) {
+                        memset(evt, 0, 32);
+                        memcpy(evt, &t->io_userdata, 8); /* userdata */
+                        /* error = 0, type = 0 (clock) — already zeroed */
+                    }
+                    uint32_t *nev = (uint32_t *)wasm_runtime_addr_app_to_native(
+                        inst, (uint64_t)t->io_nevents_ptr);
+                    if (nev) *nev = 1;
+                }
+                t->state = THREAD_READY;
+                t->io_op_type = IO_OP_NONE;
+            }
+        } else if (t->io_op_type == IO_OP_READ || t->io_op_type == IO_OP_WRITE) {
+            /* Host async I/O — poll the host */
+            if (host_io_check(t->io_callback_id)) {
+                uint32_t bytes = host_io_result_bytes(t->io_callback_id);
+                uint32_t error = host_io_result_error(t->io_callback_id);
+
+                /* Write nread/nwritten to guest memory */
+                if (t->io_result_ptr && t->exec_env) {
+                    wasm_module_inst_t inst =
+                        wasm_runtime_get_module_inst(t->exec_env);
+                    uint32_t *nrw = (uint32_t *)wasm_runtime_addr_app_to_native(
+                        inst, (uint64_t)t->io_result_ptr);
+                    if (nrw) *nrw = bytes;
+                }
+                t->io_wasi_errno = (int32_t)error;
+                t->state = THREAD_READY;
+                t->io_op_type = IO_OP_NONE;
             }
         }
     }
@@ -194,8 +259,9 @@ wasmkernel_scheduler_step(void)
     if (!has_live_threads())
         return 1; /* all done */
 
-    /* Check wait timeouts */
+    /* Check wait timeouts and I/O completions */
     check_wait_timeouts();
+    check_io_completions();
 
     /* Pick next ready thread */
     WasmKernelThread *thread = pick_next_thread();
@@ -294,6 +360,53 @@ wasmkernel_scheduler_step(void)
         return 1; /* all done */
 
     return 0; /* other threads still running */
+}
+
+uint32_t
+wasmkernel_scheduler_block_on_io(wasm_exec_env_t exec_env,
+                                  uint32_t op_type, uint32_t result_ptr)
+{
+    uint32_t cb_id = ++g_scheduler.next_callback_id;
+
+    for (uint32_t i = 0; i < g_scheduler.num_threads; i++) {
+        WasmKernelThread *t = &g_scheduler.threads[i];
+        if (t->exec_env == exec_env) {
+            t->state = THREAD_BLOCKED_IO;
+            t->io_callback_id = cb_id;
+            t->io_op_type = op_type;
+            t->io_result_ptr = result_ptr;
+            t->io_wasi_errno = 0;
+
+            WASM_SUSPEND_FLAGS_FETCH_OR(exec_env->suspend_flags,
+                                        WASM_SUSPEND_FLAG_YIELD);
+            return cb_id;
+        }
+    }
+    return 0;
+}
+
+void
+wasmkernel_scheduler_block_on_poll_clock(wasm_exec_env_t exec_env,
+                                          uint64_t deadline_us,
+                                          uint32_t event_out_ptr,
+                                          uint32_t nevents_ptr,
+                                          uint64_t userdata)
+{
+    for (uint32_t i = 0; i < g_scheduler.num_threads; i++) {
+        WasmKernelThread *t = &g_scheduler.threads[i];
+        if (t->exec_env == exec_env) {
+            t->state = THREAD_BLOCKED_IO;
+            t->io_op_type = IO_OP_POLL_CLOCK;
+            t->io_deadline_us = deadline_us;
+            t->io_event_out_ptr = event_out_ptr;
+            t->io_nevents_ptr = nevents_ptr;
+            t->io_userdata = userdata;
+
+            WASM_SUSPEND_FLAGS_FETCH_OR(exec_env->suspend_flags,
+                                        WASM_SUSPEND_FLAG_YIELD);
+            return;
+        }
+    }
 }
 
 bool

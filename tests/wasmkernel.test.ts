@@ -113,3 +113,20 @@ describe("Phase 2: cooperative threading", () => {
     expect(s?.status).toBe(1);
   });
 });
+
+describe("Phase 3: I/O bridge", () => {
+  test("poll_oneoff clock subscription (sleep)", async () => {
+    const result = await runGuest("poll_sleep.wasm");
+    expect(result.stdout).toBe("poll_sleep ok");
+    const s = parseStatus(result.stderr);
+    expect(s?.status).toBe(1);
+  });
+
+  test("sleep + concurrent compute across threads", async () => {
+    const result = await runGuest("sleep_and_compute.wasm");
+    expect(result.stdout).toContain("sleep_and_compute ok");
+    expect(result.stdout).toContain("sum=500500");
+    const s = parseStatus(result.stderr);
+    expect(s?.status).toBe(1);
+  });
+});
