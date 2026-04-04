@@ -108,6 +108,7 @@
         // Host I/O bridge
         const pendingIO = new Map();
         const hostImports = {
+          host_func_call(funcIdx, argsPtr, argc) { return 0n; },
           host_io_submit(callbackId, opType, fd, bufPtr, len) {
             if (opType === 1) {
               pendingIO.set(callbackId, { bytes: 0, error: 0 }); // EOF

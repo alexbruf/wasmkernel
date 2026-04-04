@@ -35,6 +35,221 @@ __attribute__((import_module("host"), import_name("host_io_submit")))
 extern void host_io_submit(uint32_t callback_id, uint32_t op_type,
                             uint32_t fd, uint32_t buf_ptr, uint32_t len);
 
+/* ===== Generic host function bridge ===== */
+/*
+ * Any guest import that the kernel doesn't handle internally gets
+ * forwarded to the host via this trampoline. The host provides the
+ * actual implementation (e.g. N-API, custom APIs, etc).
+ *
+ * func_idx:  bridge slot index (maps to module_name + field_name)
+ * args_ptr:  pointer to raw uint64 args array in kernel memory
+ * argc:      number of arguments
+ * returns:   i64 return value (0 if void)
+ */
+__attribute__((import_module("host"), import_name("host_func_call")))
+extern int64_t host_func_call(uint32_t func_idx, uint32_t args_ptr,
+                               uint32_t argc);
+
+#define MAX_BRIDGE_FUNCS 128
+
+/* Bridge registry */
+static uint32_t g_bridge_count = 0;
+static char g_bridge_module_names[MAX_BRIDGE_FUNCS][64];
+static char g_bridge_field_names[MAX_BRIDGE_FUNCS][64];
+static char g_bridge_signatures[MAX_BRIDGE_FUNCS][32];
+static uint16_t g_bridge_param_counts[MAX_BRIDGE_FUNCS];
+static bool g_bridge_has_return[MAX_BRIDGE_FUNCS];
+
+/* Dispatch: called by each bridge handler with its index */
+static void
+bridge_dispatch(uint32_t idx, wasm_exec_env_t exec_env, uint64 *args)
+{
+    (void)exec_env;
+    uint32_t argc = g_bridge_param_counts[idx];
+    int64_t ret = host_func_call(idx, (uint32_t)(uintptr_t)args, argc);
+    if (g_bridge_has_return[idx]) {
+        /* Write return value to args[0] (raw API convention) */
+        args[0] = (uint64)ret;
+    }
+}
+
+/* Generate 128 bridge handler functions via macro */
+#define B(N) static void bfn_##N(wasm_exec_env_t e, uint64 *a) { bridge_dispatch(N, e, a); }
+
+B(0)   B(1)   B(2)   B(3)   B(4)   B(5)   B(6)   B(7)
+B(8)   B(9)   B(10)  B(11)  B(12)  B(13)  B(14)  B(15)
+B(16)  B(17)  B(18)  B(19)  B(20)  B(21)  B(22)  B(23)
+B(24)  B(25)  B(26)  B(27)  B(28)  B(29)  B(30)  B(31)
+B(32)  B(33)  B(34)  B(35)  B(36)  B(37)  B(38)  B(39)
+B(40)  B(41)  B(42)  B(43)  B(44)  B(45)  B(46)  B(47)
+B(48)  B(49)  B(50)  B(51)  B(52)  B(53)  B(54)  B(55)
+B(56)  B(57)  B(58)  B(59)  B(60)  B(61)  B(62)  B(63)
+B(64)  B(65)  B(66)  B(67)  B(68)  B(69)  B(70)  B(71)
+B(72)  B(73)  B(74)  B(75)  B(76)  B(77)  B(78)  B(79)
+B(80)  B(81)  B(82)  B(83)  B(84)  B(85)  B(86)  B(87)
+B(88)  B(89)  B(90)  B(91)  B(92)  B(93)  B(94)  B(95)
+B(96)  B(97)  B(98)  B(99)  B(100) B(101) B(102) B(103)
+B(104) B(105) B(106) B(107) B(108) B(109) B(110) B(111)
+B(112) B(113) B(114) B(115) B(116) B(117) B(118) B(119)
+B(120) B(121) B(122) B(123) B(124) B(125) B(126) B(127)
+
+#undef B
+
+typedef void (*bridge_fn_t)(wasm_exec_env_t, uint64 *);
+static bridge_fn_t g_bridge_fns[MAX_BRIDGE_FUNCS] = {
+    bfn_0,   bfn_1,   bfn_2,   bfn_3,   bfn_4,   bfn_5,   bfn_6,   bfn_7,
+    bfn_8,   bfn_9,   bfn_10,  bfn_11,  bfn_12,  bfn_13,  bfn_14,  bfn_15,
+    bfn_16,  bfn_17,  bfn_18,  bfn_19,  bfn_20,  bfn_21,  bfn_22,  bfn_23,
+    bfn_24,  bfn_25,  bfn_26,  bfn_27,  bfn_28,  bfn_29,  bfn_30,  bfn_31,
+    bfn_32,  bfn_33,  bfn_34,  bfn_35,  bfn_36,  bfn_37,  bfn_38,  bfn_39,
+    bfn_40,  bfn_41,  bfn_42,  bfn_43,  bfn_44,  bfn_45,  bfn_46,  bfn_47,
+    bfn_48,  bfn_49,  bfn_50,  bfn_51,  bfn_52,  bfn_53,  bfn_54,  bfn_55,
+    bfn_56,  bfn_57,  bfn_58,  bfn_59,  bfn_60,  bfn_61,  bfn_62,  bfn_63,
+    bfn_64,  bfn_65,  bfn_66,  bfn_67,  bfn_68,  bfn_69,  bfn_70,  bfn_71,
+    bfn_72,  bfn_73,  bfn_74,  bfn_75,  bfn_76,  bfn_77,  bfn_78,  bfn_79,
+    bfn_80,  bfn_81,  bfn_82,  bfn_83,  bfn_84,  bfn_85,  bfn_86,  bfn_87,
+    bfn_88,  bfn_89,  bfn_90,  bfn_91,  bfn_92,  bfn_93,  bfn_94,  bfn_95,
+    bfn_96,  bfn_97,  bfn_98,  bfn_99,  bfn_100, bfn_101, bfn_102, bfn_103,
+    bfn_104, bfn_105, bfn_106, bfn_107, bfn_108, bfn_109, bfn_110, bfn_111,
+    bfn_112, bfn_113, bfn_114, bfn_115, bfn_116, bfn_117, bfn_118, bfn_119,
+    bfn_120, bfn_121, bfn_122, bfn_123, bfn_124, bfn_125, bfn_126, bfn_127,
+};
+
+/* Build raw API signature string from WASMFuncType */
+#include "wasm.h"  /* for WASMModule, WASMImport, WASMFuncType */
+
+static void
+build_raw_signature(WASMFuncType *ft, char *buf, size_t bufsz)
+{
+    /* Raw API signature: "(params)ret" where
+     * i=i32, I=i64, f=f32, F=f64
+     * No return char if void */
+    size_t pos = 0;
+    buf[pos++] = '(';
+    for (uint16_t i = 0; i < ft->param_count && pos < bufsz - 3; i++) {
+        switch (ft->types[i]) {
+            case VALUE_TYPE_I32: buf[pos++] = 'i'; break;
+            case VALUE_TYPE_I64: buf[pos++] = 'I'; break;
+            case VALUE_TYPE_F32: buf[pos++] = 'f'; break;
+            case VALUE_TYPE_F64: buf[pos++] = 'F'; break;
+            default: buf[pos++] = 'i'; break; /* fallback */
+        }
+    }
+    buf[pos++] = ')';
+    if (ft->result_count > 0) {
+        switch (ft->types[ft->param_count]) {
+            case VALUE_TYPE_I32: buf[pos++] = 'i'; break;
+            case VALUE_TYPE_I64: buf[pos++] = 'I'; break;
+            case VALUE_TYPE_F32: buf[pos++] = 'f'; break;
+            case VALUE_TYPE_F64: buf[pos++] = 'F'; break;
+            default: buf[pos++] = 'i'; break;
+        }
+    }
+    buf[pos] = '\0';
+}
+
+/* Scan guest module imports and register bridge handlers for unknown modules.
+ * Must be called after wasm_runtime_load but before wasm_runtime_instantiate.
+ * Functions the kernel handles internally are skipped; everything else is bridged. */
+static void
+register_bridge_imports(wasm_module_t module,
+                        NativeSymbol *wasi_syms, uint32_t num_wasi_syms)
+{
+    WASMModule *m = (WASMModule *)module;
+    g_bridge_count = 0;
+
+    /* Collect imports that need bridging — skip only functions
+       the kernel handles internally */
+    for (uint32_t i = 0; i < m->import_function_count; i++) {
+        WASMFunctionImport *fi = &m->import_functions[i].u.function;
+
+        /* Skip wasi.thread-spawn — handled by lib-wasi-threads */
+        if (strcmp(fi->module_name, "wasi") == 0)
+            continue;
+
+        /* Skip wasi_snapshot_preview1 functions we handle internally */
+        if (strcmp(fi->module_name, "wasi_snapshot_preview1") == 0) {
+            bool handled = false;
+            for (uint32_t j = 0; j < num_wasi_syms; j++) {
+                if (strcmp(fi->field_name, wasi_syms[j].symbol) == 0) {
+                    handled = true;
+                    break;
+                }
+            }
+            if (handled)
+                continue;
+        }
+
+        if (g_bridge_count >= MAX_BRIDGE_FUNCS) {
+            fprintf(stderr, "wasmkernel: too many bridge imports (max %d)\n",
+                    MAX_BRIDGE_FUNCS);
+            break;
+        }
+
+        uint32_t idx = g_bridge_count;
+        strncpy(g_bridge_module_names[idx], fi->module_name, 63);
+        g_bridge_module_names[idx][63] = '\0';
+        strncpy(g_bridge_field_names[idx], fi->field_name, 63);
+        g_bridge_field_names[idx][63] = '\0';
+        build_raw_signature(fi->func_type, g_bridge_signatures[idx], 32);
+        g_bridge_param_counts[idx] = fi->func_type->param_count;
+        g_bridge_has_return[idx] = fi->func_type->result_count > 0;
+        g_bridge_count++;
+    }
+
+    /* Register bridge natives grouped by module name */
+    if (g_bridge_count == 0)
+        return;
+
+    /* We need to register per-module. Group by module name. */
+    for (uint32_t i = 0; i < g_bridge_count; i++) {
+        /* Check if this module was already registered */
+        bool already = false;
+        for (uint32_t j = 0; j < i; j++) {
+            if (strcmp(g_bridge_module_names[i],
+                       g_bridge_module_names[j]) == 0) {
+                already = true;
+                break;
+            }
+        }
+        if (already)
+            continue;
+
+        /* Count functions in this module */
+        uint32_t count = 0;
+        for (uint32_t j = i; j < g_bridge_count; j++) {
+            if (strcmp(g_bridge_module_names[i],
+                       g_bridge_module_names[j]) == 0)
+                count++;
+        }
+
+        /* Build NativeSymbol array for this module */
+        NativeSymbol *syms = (NativeSymbol *)malloc(
+            count * sizeof(NativeSymbol));
+        if (!syms) continue;
+
+        uint32_t si = 0;
+        for (uint32_t j = i; j < g_bridge_count && si < count; j++) {
+            if (strcmp(g_bridge_module_names[i],
+                       g_bridge_module_names[j]) != 0)
+                continue;
+            syms[si].symbol = g_bridge_field_names[j];
+            syms[si].func_ptr = (void *)g_bridge_fns[j];
+            syms[si].signature = g_bridge_signatures[j];
+            syms[si].attachment = NULL;
+            si++;
+        }
+
+        if (!wasm_runtime_register_natives_raw(
+                g_bridge_module_names[i], syms, count)) {
+            fprintf(stderr, "wasmkernel: failed to register bridge for '%s'\n",
+                    g_bridge_module_names[i]);
+        }
+        /* Note: syms must stay alive — WAMR references it.
+           We leak intentionally (loaded once per guest). */
+    }
+}
+
 /* ===== Minimal WASI passthrough (raw native API) ===== */
 /*
  * All handlers use void func(wasm_exec_env_t, uint64 *args).
@@ -447,9 +662,28 @@ kernel_load(uint32_t wasm_ptr, uint32_t wasm_len)
         return -2;
     }
 
-    /* 256KB stack, 512KB heap — enough for threading guests */
+    /* Scan guest imports and register bridge handlers for any
+       import the kernel doesn't handle internally */
+    register_bridge_imports(g_guest_module, g_wasi_symbols, NUM_WASI_SYMBOLS);
+
+    /* Cap guest max memory on wasm32 — we can't allocate 4GB inside
+       the kernel's own 4GB address space. 256MB is generous. */
+    {
+        WASMModule *m = (WASMModule *)g_guest_module;
+        uint32_t cap = 256 * 1024 * 1024 / 65536; /* 4096 pages = 256MB */
+        for (uint32_t i = 0; i < m->import_memory_count; i++) {
+            if (m->import_memories[i].u.memory.mem_type.max_page_count > cap)
+                m->import_memories[i].u.memory.mem_type.max_page_count = cap;
+        }
+        for (uint32_t i = 0; i < m->memory_count; i++) {
+            if (m->memories[i].max_page_count > cap)
+                m->memories[i].max_page_count = cap;
+        }
+    }
+
+    /* 256KB stack, 64MB heap — large guests like oxide need ~62MB shared memory */
     g_guest_instance = wasm_runtime_instantiate(g_guest_module,
-                                                 256 * 1024, 512 * 1024,
+                                                 256 * 1024, 64 * 1024 * 1024,
                                                  g_error_buf, sizeof(g_error_buf));
     if (!g_guest_instance) {
         printf("kernel_load: %s\n", g_error_buf);
@@ -517,4 +751,43 @@ kernel_thread_count(void)
             live++;
     }
     return live;
+}
+
+/* ===== Bridge introspection exports ===== */
+/* Host calls these after kernel_load to discover bridge mappings */
+
+__attribute__((export_name("kernel_bridge_count")))
+uint32_t
+kernel_bridge_count(void)
+{
+    return g_bridge_count;
+}
+
+/* Write bridge info for slot idx into buf: "module\0field\0signature\0"
+ * Returns bytes written, or 0 if idx out of range */
+__attribute__((export_name("kernel_bridge_info")))
+uint32_t
+kernel_bridge_info(uint32_t idx, uint32_t buf_ptr, uint32_t buf_len)
+{
+    if (idx >= g_bridge_count)
+        return 0;
+
+    char *buf = (char *)(uintptr_t)buf_ptr;
+    uint32_t pos = 0;
+
+    const char *mod = g_bridge_module_names[idx];
+    const char *field = g_bridge_field_names[idx];
+    const char *sig = g_bridge_signatures[idx];
+
+    uint32_t ml = strlen(mod) + 1;
+    uint32_t fl = strlen(field) + 1;
+    uint32_t sl = strlen(sig) + 1;
+
+    if (pos + ml + fl + sl > buf_len)
+        return 0;
+
+    memcpy(buf + pos, mod, ml); pos += ml;
+    memcpy(buf + pos, field, fl); pos += fl;
+    memcpy(buf + pos, sig, sl); pos += sl;
+    return pos;
 }
