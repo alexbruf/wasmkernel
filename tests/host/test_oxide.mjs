@@ -137,10 +137,25 @@ console.log("napi_register_wasm_v1:", reg.status === 0 ? "OK" : `FAIL(${reg.stat
 // Check what we got
 const resultObj = napiRuntime._getHandle(reg.retVal) ?? exportsObj;
 console.log("\n=== Results ===");
-console.log("Return handle:", reg.retVal);
-console.log("Exports object:", resultObj);
 console.log("Exports keys:", Object.keys(resultObj));
+
 if (resultObj.Scanner) {
   console.log("Scanner class:", resultObj.Scanner);
-  console.log("Scanner.prototype:", Object.keys(resultObj.Scanner.prototype ?? {}));
+  console.log("Scanner methods:", Object.keys(resultObj.Scanner.prototype ?? {}));
+
+  // Try creating a Scanner instance and scanning some HTML
+  console.log("\n=== Trying Scanner ===");
+  try {
+    const sources = [
+      { content: '<div class="flex items-center bg-blue-500 p-4 text-white hover:bg-blue-600">Hello</div>', extension: 'html' },
+    ];
+    const scanner = new resultObj.Scanner({ sources });
+    console.log("Scanner created:", scanner);
+
+    const candidates = scanner.getCandidatesWithPositions();
+    console.log("Candidates:", candidates);
+  } catch (e) {
+    console.error("Scanner error:", e.message);
+    console.error("Stack:", e.stack?.split('\n').slice(0, 5).join('\n'));
+  }
 }
