@@ -52,12 +52,49 @@ export class NapiRuntime {
     this._escapedScopes = new Set();
     this._abMemory = new WeakMap();
 
+    // FinalizationRegistry for calling C destructors when JS GC collects handles
+    this._postedFinalizers = [];
+    this._postedFinalizersPending = false;
+    if (typeof FinalizationRegistry !== 'undefined') {
+      this._postedFinalizers = [];
+      this._postedFinalizersPending = false;
+      this._postedFinalizersRegistry = new FinalizationRegistry((info) => {
+        // info = { cb, env, data, hint }
+        // Can't call kernel_call_indirect in finalizer callback (not in JS call stack from wasm)
+        // Queue it and drain when next bridge call happens
+        this._postedFinalizers.push(info);
+        this._postedFinalizersPending = true;
+      });
+    }
+
     // Pre-register env handle
     this.handles.set(1, { type: 'env' });
 
     // Pre-register global and undefined
     this.undefinedHandle = this._newHandle(undefined);
     this.globalHandle = this._newHandle(globalThis);
+  }
+
+  // Register a destructor callback for a JS object
+  _registerFinalizer(jsObj, finalizeCb, dataPtr, hintPtr) {
+    if (this._postedFinalizersRegistry && finalizeCb) {
+      this._postedFinalizersRegistry.register(jsObj, { cb: finalizeCb, data: dataPtr, hint: hintPtr });
+    }
+  }
+
+  // Drain queued destructor callbacks (called from dispatch)
+  _drainFinalizers() {
+    while (this._postedFinalizers.length > 0) {
+      const { cb, data, hint } = this._postedFinalizers.shift();
+      try {
+        const ap = this.k.kernel_alloc(16);
+        new DataView(this._buf()).setUint32(ap, 1, true);       // env
+        new DataView(this._buf()).setUint32(ap + 4, data, true); // finalize_data
+        new DataView(this._buf()).setUint32(ap + 8, hint, true); // finalize_hint
+        this.k.kernel_call_indirect(cb, 3, ap);
+      } catch {}
+    }
+    this._postedFinalizersPending = false;
   }
 
   _newHandle(value) {
@@ -492,11 +529,12 @@ export class NapiRuntime {
   }
 
   napi_wrap(args) {
-    const [env, objectHandle, nativePtr, _finalize, _hint, resultPtr] = args;
-    // Key by JS object identity, not handle ID — different handles may point to same object
+    const [env, objectHandle, nativePtr, finalizeCb, finalizeHint, resultPtr] = args;
     const obj = this._getHandle(objectHandle);
     if (obj && typeof obj === 'object') {
+      if (this.wraps.has(obj)) return napi_invalid_arg; // already wrapped
       this.wraps.set(obj, nativePtr);
+      this._registerFinalizer(obj, finalizeCb, nativePtr, finalizeHint);
     }
     if (resultPtr) {
       const refId = this.nextRef++;
@@ -1451,6 +1489,7 @@ export class NapiRuntime {
     const [env, dataPtr, finalizeCb, finalizeHint, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
     const ext = { __external: true, data: dataPtr };
+    this._registerFinalizer(ext, finalizeCb, dataPtr, finalizeHint);
     const h = this._newHandle(ext);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -1702,8 +1741,20 @@ export class NapiRuntime {
     return napi_ok;
   }
 
-  // napi_add_finalizer — no-op (no GC tracking in our bridge)
-  napi_add_finalizer(args) { return napi_ok; }
+  // napi_add_finalizer(env, object, data, finalize_cb, hint, result)
+  napi_add_finalizer(args) {
+    const [env, objectHandle, dataPtr, finalizeCb, finalizeHint, resultPtr] = args;
+    const obj = this._getHandle(objectHandle);
+    if (obj && typeof obj === 'object') {
+      this._registerFinalizer(obj, finalizeCb, dataPtr, finalizeHint);
+    }
+    if (resultPtr) {
+      const refId = this.nextRef++;
+      this.refs.set(refId, { handle: objectHandle, refcount: 0 });
+      this._writeU32(resultPtr, refId);
+    }
+    return napi_ok;
+  }
 
   // ===== Async work =====
   _asyncWorks = new Map();
@@ -2042,6 +2093,8 @@ export class NapiRuntime {
   // Dispatch: find the right method by function name
   dispatch(funcName, args, argsPtr) {
     this._currentArgsPtr = argsPtr;
+    // Drain any queued GC finalizers
+    if (this._postedFinalizersPending) this._drainFinalizers();
     // env=NULL check
     if (args[0] === 0 && funcName.startsWith('napi_') && funcName !== 'napi_fatal_error') {
       this._lastStatus = napi_invalid_arg;
