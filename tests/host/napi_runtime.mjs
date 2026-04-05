@@ -117,9 +117,11 @@ export class NapiRuntime {
     return writeLen;
   }
 
-  // Write a handle to a guest result pointer
+  // Write a handle to a guest result pointer. Returns false if ptr is NULL.
   _writeResult(resultPtr, handle) {
-    if (resultPtr) this._writeU32(resultPtr, handle);
+    if (!resultPtr) return false;
+    this._writeU32(resultPtr, handle);
+    return true;
   }
 
   // ===== N-API implementations =====
@@ -127,6 +129,7 @@ export class NapiRuntime {
 
   napi_create_object(args) {
     const [env, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const h = this._newHandle({});
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -134,18 +137,21 @@ export class NapiRuntime {
 
   napi_get_undefined(args) {
     const [env, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     this._writeResult(resultPtr, this.undefinedHandle);
     return napi_ok;
   }
 
   napi_get_global(args) {
     const [env, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     this._writeResult(resultPtr, this.globalHandle);
     return napi_ok;
   }
 
   napi_create_string_utf8(args) {
     const [env, strPtr, len, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     // len = -1 means null-terminated; otherwise use len
     let str;
     if (len === 0xFFFFFFFF || len === -1) {
@@ -280,6 +286,7 @@ export class NapiRuntime {
         : this._readString(namePtr, nameLen);
       Object.defineProperty(fn, 'name', { value: name });
     }
+    if (!resultPtr) return napi_invalid_arg;
     const h = this._newHandle(fn);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -310,6 +317,7 @@ export class NapiRuntime {
 
   napi_create_array_with_length(args) {
     const [env, len, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const h = this._newHandle(new Array(len));
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -348,6 +356,7 @@ export class NapiRuntime {
 
   napi_create_reference(args) {
     const [env, valueHandle, initialRefcount, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const refId = this.nextRef++;
     this.refs.set(refId, { handle: valueHandle, refcount: initialRefcount });
     this._writeU32(resultPtr, refId);
@@ -377,6 +386,8 @@ export class NapiRuntime {
 
   napi_define_class(args) {
     const [env, namePtr, nameLen, ctorCbPtr, ctorData, propCount, propsPtr, resultPtr] = args;
+    if (!namePtr || !ctorCbPtr || !resultPtr || (propCount > 0 && !propsPtr))
+      return napi_invalid_arg;
     const className = nameLen === 0xFFFFFFFF
       ? this._readNullTermString(namePtr)
       : this._readString(namePtr, nameLen);
@@ -404,6 +415,7 @@ export class NapiRuntime {
       this._applyPropertyDescriptors(target, 1, propsPtr + i * PROP_SIZE);
     }
 
+    if (!resultPtr) return napi_invalid_arg;
     const h = this._newHandle(ctor);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -446,6 +458,7 @@ export class NapiRuntime {
     // Signature: (env: i32, value: i64, result: i32) — read full i64 from raw args
     const val = Number(this._readArgI64(this._currentArgsPtr, 1));
     const resultPtr = args[2];
+    if (!resultPtr) return napi_invalid_arg;
     const h = this._newHandle(val);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -453,6 +466,7 @@ export class NapiRuntime {
 
   napi_coerce_to_string(args) {
     const [env, valueHandle, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
     const h = this._newHandle(String(val ?? ''));
     this._writeResult(resultPtr, h);
@@ -461,6 +475,7 @@ export class NapiRuntime {
 
   napi_coerce_to_object(args) {
     const [env, valueHandle, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
     const h = this._newHandle(Object(val));
     this._writeResult(resultPtr, h);
@@ -514,6 +529,7 @@ export class NapiRuntime {
 
   napi_create_error(args) {
     const [env, codeHandle, msgHandle, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const msg = this._getHandle(msgHandle);
     const err = new Error(typeof msg === 'string' ? msg : String(msg));
     const h = this._newHandle(err);
@@ -577,12 +593,38 @@ export class NapiRuntime {
   }
 
   // napi_get_last_error_info(env, result_ptr) -> status
-  // Writes a napi_extended_error_info struct to guest memory
   napi_get_last_error_info(args) {
     const [env, resultPtr] = args;
-    // For now, write a null pointer (no error info available)
-    // In a full implementation, this would track the last error
-    this._writeU32(resultPtr, 0);
+    if (!resultPtr) return napi_invalid_arg;
+    // Allocate error info struct in guest memory (16 bytes)
+    // napi_extended_error_info: error_message(i32), engine_reserved(i32), engine_error_code(u32), error_code(i32)
+    if (!this._errorInfoPtr) {
+      this._errorInfoPtr = this.k.kernel_alloc(16);
+    }
+    const p = this._errorInfoPtr;
+    const status = this._lastStatus ?? 0;
+    // Error messages per status
+    const messages = [
+      null, 'Invalid argument', 'An object was expected', 'A string was expected',
+      'A name was expected', 'A function was expected', 'A number was expected',
+      'A boolean was expected', 'An array was expected', 'Unknown failure',
+      'An exception is pending', 'Cancelled', 'napi_escape_called_twice',
+    ];
+    const msg = messages[status] ?? null;
+    let msgPtr = 0;
+    if (msg) {
+      if (!this._errorMsgBuf) this._errorMsgBuf = this.k.kernel_alloc(256);
+      const base = this._guestBase();
+      const mem = new Uint8Array(this._buf());
+      for (let i = 0; i < msg.length; i++) mem[base + this._errorMsgBuf + i] = msg.charCodeAt(i);
+      mem[base + this._errorMsgBuf + msg.length] = 0;
+      msgPtr = this._errorMsgBuf;
+    }
+    this._writeU32(p, msgPtr);      // error_message
+    this._writeU32(p + 4, 0);       // engine_reserved
+    this._writeU32(p + 8, 0);       // engine_error_code
+    this._writeU32(p + 12, status); // error_code (napi_status)
+    this._writeU32(resultPtr, p);   // write pointer to struct
     return napi_ok;
   }
 
@@ -624,6 +666,7 @@ export class NapiRuntime {
   // napi_create_int32(env, value, result_ptr)
   napi_create_int32(args) {
     const [env, value, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     // value is passed as i32 through bridge
     const h = this._newHandle(value | 0);
     this._writeResult(resultPtr, h);
@@ -633,6 +676,7 @@ export class NapiRuntime {
   // napi_create_uint32(env, value, result_ptr)
   napi_create_uint32(args) {
     const [env, value, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const h = this._newHandle(value >>> 0);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -643,6 +687,7 @@ export class NapiRuntime {
     // arg[1] is f64 in bridge — read raw 8 bytes, arg[2] is result ptr
     const val = this._readArgF64(this._currentArgsPtr, 1);
     const resultPtr = args[2]; // 3rd raw slot = result ptr (after f64)
+    if (!resultPtr) return napi_invalid_arg;
     const h = this._newHandle(val);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -680,6 +725,7 @@ export class NapiRuntime {
   // napi_get_null(env, result_ptr)
   napi_get_null(args) {
     const [env, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const h = this._newHandle(null);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -688,6 +734,7 @@ export class NapiRuntime {
   // napi_get_boolean(env, value, result_ptr)
   napi_get_boolean(args) {
     const [env, value, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const h = this._newHandle(!!value);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -696,6 +743,7 @@ export class NapiRuntime {
   // napi_create_string_latin1(env, str_ptr, len, result_ptr)
   napi_create_string_latin1(args) {
     const [env, strPtr, len, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     // Latin1 is essentially the same as reading bytes
     const actualLen = (len === 0xFFFFFFFF) ? undefined : len;
     let str;
@@ -822,6 +870,7 @@ export class NapiRuntime {
   // ===== Buffer API =====
   napi_create_buffer(args) {
     const [env, length, dataPtr, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const guestPtr = length > 0 ? this.k.kernel_alloc(length) : 0;
     if (dataPtr) this._writeU32(dataPtr, guestPtr);
     const buf = this._createGuestBuffer(guestPtr, length);
@@ -1072,6 +1121,7 @@ export class NapiRuntime {
   // napi_create_string_utf16(env, str_ptr, len, result)
   napi_create_string_utf16(args) {
     const [env, strPtr, len, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const base = this._guestBase();
     const actualLen = len === 0xFFFFFFFF ? -1 : len;
     let str = '';
@@ -1137,6 +1187,7 @@ export class NapiRuntime {
   // napi_create_bigint_words(env, sign_bit, word_count, words, result)
   napi_create_bigint_words(args) {
     const [env, signBit, wordCount, wordsPtr, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     let val = 0n;
     const base = this._guestBase();
     for (let i = 0; i < wordCount; i++) {
@@ -1227,6 +1278,7 @@ export class NapiRuntime {
   // napi_coerce_to_bool(env, value, result)
   napi_coerce_to_bool(args) {
     const [env, valueHandle, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
     const h = this._newHandle(!!val);
     this._writeResult(resultPtr, h);
@@ -1236,6 +1288,7 @@ export class NapiRuntime {
   // napi_coerce_to_number(env, value, result)
   napi_coerce_to_number(args) {
     const [env, valueHandle, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
     const h = this._newHandle(Number(val));
     this._writeResult(resultPtr, h);
@@ -1245,6 +1298,7 @@ export class NapiRuntime {
   // napi_create_type_error(env, code, msg, result)
   napi_create_type_error(args) {
     const [env, codeHandle, msgHandle, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const msg = this._getHandle(msgHandle);
     const err = new TypeError(typeof msg === 'string' ? msg : String(msg));
     if (codeHandle) { const code = this._getHandle(codeHandle); if (code) err.code = code; }
@@ -1256,6 +1310,7 @@ export class NapiRuntime {
   // napi_create_range_error(env, code, msg, result)
   napi_create_range_error(args) {
     const [env, codeHandle, msgHandle, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const msg = this._getHandle(msgHandle);
     const err = new RangeError(typeof msg === 'string' ? msg : String(msg));
     if (codeHandle) { const code = this._getHandle(codeHandle); if (code) err.code = code; }
@@ -1311,6 +1366,7 @@ export class NapiRuntime {
   // napi_create_array(env, result)
   napi_create_array(args) {
     const [env, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const h = this._newHandle([]);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -1358,6 +1414,7 @@ export class NapiRuntime {
   // napi_create_external(env, data, finalize_cb, finalize_hint, result)
   napi_create_external(args) {
     const [env, dataPtr, finalizeCb, finalizeHint, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const ext = { __external: true, data: dataPtr };
     const h = this._newHandle(ext);
     this._writeResult(resultPtr, h);
@@ -1418,6 +1475,7 @@ export class NapiRuntime {
   // napi_create_symbol(env, description, result)
   napi_create_symbol(args) {
     const [env, descHandle, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const desc = descHandle ? this._getHandle(descHandle) : undefined;
     const sym = Symbol(desc);
     const h = this._newHandle(sym);
@@ -1444,6 +1502,7 @@ export class NapiRuntime {
   // napi_create_promise(env, deferred, result)
   napi_create_promise(args) {
     const [env, deferredPtr, resultPtr] = args;
+    if (!deferredPtr) return napi_invalid_arg;
     let resolve, reject;
     const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
     const deferredId = this.nextRef++;
@@ -1547,6 +1606,7 @@ export class NapiRuntime {
   napi_create_date(args) {
     const time = this._readArgF64(this._currentArgsPtr, 1);
     const resultPtr = args[2];
+    if (!resultPtr) return napi_invalid_arg;
     const h = this._newHandle(new Date(time));
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -1572,11 +1632,19 @@ export class NapiRuntime {
   // napi_get_node_version(env, result) — writes to a struct pointer
   napi_get_node_version(args) {
     const [env, resultPtr] = args;
-    // napi_node_version: major(u32) + minor(u32) + patch(u32) + release(char*)
-    this._writeU32(resultPtr, 22);     // major
-    this._writeU32(resultPtr + 4, 0);  // minor
-    this._writeU32(resultPtr + 8, 0);  // patch
-    this._writeU32(resultPtr + 12, 0); // release (null ptr)
+    if (!resultPtr) return napi_invalid_arg;
+    const parts = (typeof process !== 'undefined' ? process.version : 'v0.0.0').replace('v','').split('-')[0].split('.');
+    this._writeU32(resultPtr, parseInt(parts[0]) || 0);
+    this._writeU32(resultPtr + 4, parseInt(parts[1]) || 0);
+    this._writeU32(resultPtr + 8, parseInt(parts[2]) || 0);
+    // Write release name to guest memory
+    const rel = typeof process !== 'undefined' ? (process.release?.name ?? 'node') : 'node';
+    const rp = this.k.kernel_alloc(rel.length + 1);
+    const base = this._guestBase();
+    const mem = new Uint8Array(this._buf());
+    for (let i = 0; i < rel.length; i++) mem[base + rp + i] = rel.charCodeAt(i);
+    mem[base + rp + rel.length] = 0;
+    this._writeU32(resultPtr + 12, rp);
     return napi_ok;
   }
 
@@ -1762,6 +1830,7 @@ export class NapiRuntime {
 
   napi_create_arraybuffer(args) {
     const [env, byteLength, dataPtr, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     // Allocate in guest memory — use a snapshot ArrayBuffer for JS side
     const guestPtr = byteLength > 0 ? this.k.kernel_alloc(byteLength) : 0;
     // Zero-initialize
@@ -1818,6 +1887,7 @@ export class NapiRuntime {
 
   napi_create_typedarray(args) {
     const [env, type, length, abHandle, byteOffset, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const ab = this._getHandle(abHandle);
     const ctors = [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array, BigInt64Array, BigUint64Array];
     const Ctor = ctors[type] ?? Uint8Array;
@@ -1850,6 +1920,7 @@ export class NapiRuntime {
 
   napi_create_dataview(args) {
     const [env, byteLength, abHandle, byteOffset, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const ab = this._getHandle(abHandle);
     const dv = new DataView(ab, byteOffset, byteLength);
     const h = this._newHandle(dv);
@@ -1862,6 +1933,7 @@ export class NapiRuntime {
     // sig: (iIi)i — value is i64
     const val = this._readArgI64(this._currentArgsPtr, 1);
     const resultPtr = args[2];
+    if (!resultPtr) return napi_invalid_arg;
     const h = this._newHandle(val); // keep as BigInt
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -1874,6 +1946,7 @@ export class NapiRuntime {
     const hi = new DataView(buf).getUint32(this._currentArgsPtr + 12, true);
     const val = BigInt(lo) + (BigInt(hi) << 32n);
     const resultPtr = args[2];
+    if (!resultPtr) return napi_invalid_arg;
     const h = this._newHandle(val);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -1921,16 +1994,23 @@ export class NapiRuntime {
 
   // Dispatch: find the right method by function name
   dispatch(funcName, args, argsPtr) {
-    this._currentArgsPtr = argsPtr; // stash for methods that need raw access
+    this._currentArgsPtr = argsPtr;
+    // env=NULL check
+    if (args[0] === 0 && funcName.startsWith('napi_') && funcName !== 'napi_fatal_error') {
+      this._lastStatus = napi_invalid_arg;
+      return BigInt(napi_invalid_arg);
+    }
     const method = this[funcName];
     if (method) {
       const result = method.call(this, args);
+      this._lastStatus = result; // track for napi_get_last_error_info
       if (this.debug) {
         console.error(`  napi: ${funcName}(${args.join(',')}) -> ${result}`);
       }
       return BigInt(result);
     }
     console.error(`napi: unimplemented ${funcName}`);
+    this._lastStatus = napi_generic_failure;
     return BigInt(napi_generic_failure);
   }
 }

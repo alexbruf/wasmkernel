@@ -229,27 +229,27 @@ describe("Phase 5: Oxide integration", () => {
 });
 
 describe("Phase 5: emnapi Node-API compliance suite", () => {
-  const passingTests = [
-    "hello", "arg", "callback", "objfac", "fnfac", "function",
-    "constructor", "conversion", "number", "error", "exception",
-    "array", "property", "symbol", "promise", "newtarget",
-    "version", "env", "date", "cbinfo", "ref", "ref_double_free",
-    "general", "object", "bigint", "dataview", "scope",
-    "async", "make_callback", "async_context", "tsfn2",
-    "object_exception", "reference_all_types", "reference_obj_only",
-    "runjs_cnrj", "runjs_pe", "buffer", "buffer_finalizer",
-    "cleanup_hook", "fatal_exception", "filename", "finalizer",
-    "ref_finalizer", "sharedarraybuffer", "string",
-    "fnwrap", "objwrap", "objnestedwrap", "objwrapbasicfinalizer",
-    "passwrap", "tsfn_abort",
-    "tsfn", "pool", "uv_threadpool_size", "trap_in_thread",
-    "async_cleanup_hook", "typedarray", "tsfn_shutdown", "string_mt",
-  ];
-
-  for (const name of passingTests) {
-    test(`emnapi/${name}`, () => {
-      const result = runNodeTest(`tests/emnapi/run_emnapi_test.mjs ${name}`);
-      expect(result.exitCode).toBe(0);
-    }, 15000); // some tests (string) need extra time
-  }
+  test("all 58 emnapi tests pass", () => {
+    const tests = [
+      "hello", "arg", "callback", "objfac", "fnfac", "function",
+      "constructor", "conversion", "number", "error", "exception",
+      "array", "property", "symbol", "promise", "newtarget",
+      "version", "env", "date", "cbinfo", "ref", "ref_double_free",
+      "general", "object", "bigint", "dataview", "scope",
+      "async", "make_callback", "async_context", "tsfn2",
+      "object_exception", "reference_all_types", "reference_obj_only",
+      "runjs_cnrj", "runjs_pe", "buffer", "buffer_finalizer",
+      "cleanup_hook", "fatal_exception", "filename", "finalizer",
+      "ref_finalizer", "sharedarraybuffer", "string",
+      "fnwrap", "objwrap", "objnestedwrap", "objwrapbasicfinalizer",
+      "passwrap", "tsfn_abort",
+      "tsfn", "pool", "uv_threadpool_size", "trap_in_thread",
+      "async_cleanup_hook", "typedarray", "tsfn_shutdown", "string_mt",
+    ];
+    const result = runNodeTest(`tests/emnapi/run_all.mjs ${tests.join(" ")}`);
+    expect(result.exitCode).toBe(0);
+    const json = JSON.parse(result.stdout.trim().split("\n").pop()!);
+    expect(json.failed).toBe(0);
+    expect(json.passed).toBe(tests.length);
+  }, 60000);
 });
