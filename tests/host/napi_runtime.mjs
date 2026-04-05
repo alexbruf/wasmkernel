@@ -13,7 +13,15 @@ const napi_ok = 0;
 const napi_invalid_arg = 1;
 const napi_object_expected = 2;
 const napi_string_expected = 3;
+const napi_name_expected = 4;
+const napi_function_expected = 5;
+const napi_number_expected = 6;
+const napi_boolean_expected = 7;
+const napi_array_expected = 8;
 const napi_generic_failure = 9;
+const napi_pending_exception = 10;
+const napi_cancelled = 11;
+const napi_escape_called_twice = 12;
 
 // napi_valuetype
 const napi_undefined = 0;
@@ -295,7 +303,7 @@ export class NapiRuntime {
     } catch (e) {
       this.lastException = e;
       this.exceptionPending = true;
-      return napi_generic_failure;
+      return napi_pending_exception;
     }
     return napi_ok;
   }
@@ -1211,7 +1219,7 @@ export class NapiRuntime {
     } catch (e) {
       this.lastException = e;
       this.exceptionPending = true;
-      return napi_generic_failure;
+      return napi_pending_exception;
     }
     return napi_ok;
   }
@@ -1506,12 +1514,17 @@ export class NapiRuntime {
   }
 
   // Handle scopes — track escapable scopes to detect double-escape
-  _escapedScopes = new Set();
-  napi_open_handle_scope(args) { return napi_ok; }
+  _nextScopeId = 1;
+  napi_open_handle_scope(args) {
+    const [env, resultPtr] = args;
+    if (this.exceptionPending) return napi_pending_exception;
+    this._writeU32(resultPtr, 0);
+    return napi_ok;
+  }
   napi_close_handle_scope(args) { return napi_ok; }
   napi_open_escapable_handle_scope(args) {
     const [env, resultPtr] = args;
-    const scopeId = this._nextRef++;
+    const scopeId = this._nextScopeId++;
     this._writeU32(resultPtr, scopeId);
     return napi_ok;
   }
@@ -1523,7 +1536,7 @@ export class NapiRuntime {
   napi_escape_handle(args) {
     const [env, scope, escapee, resultPtr] = args;
     if (this._escapedScopes.has(scope)) {
-      return 13; // napi_escape_called_twice
+      return napi_escape_called_twice;
     }
     this._escapedScopes.add(scope);
     this._writeResult(resultPtr, escapee);
@@ -1738,7 +1751,7 @@ export class NapiRuntime {
     } catch (e) {
       this.lastException = e;
       this.exceptionPending = true;
-      return napi_generic_failure;
+      return napi_pending_exception;
     }
     return napi_ok;
   }
