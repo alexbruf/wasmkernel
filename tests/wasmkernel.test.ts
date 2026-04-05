@@ -186,3 +186,70 @@ describe("Phase 4: hardening (WAMR wasi-threads test suite)", () => {
     expect(s?.status).toBe(1);
   });
 });
+
+/**
+ * Run a Node.js test script directly (not via the wasmkernel runner).
+ */
+function runNodeTest(script: string): { stdout: string; stderr: string; exitCode: number } {
+  const parts = script.split(" ");
+  const result = Bun.spawnSync(["node", "--experimental-wasi-unstable-preview1", ...parts], {
+    cwd: import.meta.dir + "/..",
+  });
+  return {
+    stdout: result.stdout.toString(),
+    stderr: result.stderr.toString(),
+    exitCode: result.exitCode,
+  };
+}
+
+describe("Phase 5: N-API compliance", () => {
+  test("napi basic test — 14 assertions", () => {
+    const result = runNodeTest("tests/host/test_napi.mjs");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("PASS");
+    expect(result.stdout).not.toContain("FAIL");
+  });
+
+  test("napi Node.js compat — 30 assertions", () => {
+    const result = runNodeTest("tests/host/test_napi_node_compat.mjs");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("30 passed, 0 failed");
+  });
+});
+
+describe("Phase 5: Oxide integration", () => {
+  test("oxide scanner produces expected CSS candidates", () => {
+    const result = runNodeTest("tests/host/test_oxide.mjs");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("Scanner created");
+    expect(result.stdout).toContain("scan count: 7");
+    expect(result.stdout).toContain("flex");
+    expect(result.stdout).toContain("bg-blue-500");
+  });
+});
+
+describe("Phase 5: emnapi Node-API compliance suite", () => {
+  const passingTests = [
+    "hello", "arg", "callback", "objfac", "fnfac", "function",
+    "constructor", "conversion", "number", "error", "exception",
+    "array", "property", "symbol", "promise", "newtarget",
+    "version", "env", "date", "cbinfo", "ref", "ref_double_free",
+    "general", "object", "bigint", "dataview", "scope",
+    "async", "make_callback", "async_context", "tsfn2",
+    "object_exception", "reference_all_types", "reference_obj_only",
+    "runjs_cnrj", "runjs_pe", "buffer", "buffer_finalizer",
+    "cleanup_hook", "fatal_exception", "filename", "finalizer",
+    "ref_finalizer", "sharedarraybuffer", "string",
+    "fnwrap", "objwrap", "objnestedwrap", "objwrapbasicfinalizer",
+    "passwrap", "tsfn_abort",
+    "tsfn", "pool", "uv_threadpool_size", "trap_in_thread",
+    "async_cleanup_hook", "typedarray", "tsfn_shutdown", "string_mt",
+  ];
+
+  for (const name of passingTests) {
+    test(`emnapi/${name}`, () => {
+      const result = runNodeTest(`tests/emnapi/run_emnapi_test.mjs ${name}`);
+      expect(result.exitCode).toBe(0);
+    }, 15000); // some tests (string) need extra time
+  }
+});

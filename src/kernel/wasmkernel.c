@@ -50,7 +50,7 @@ __attribute__((import_module("host"), import_name("host_func_call")))
 extern int64_t host_func_call(uint32_t func_idx, uint32_t args_ptr,
                                uint32_t argc);
 
-#define MAX_BRIDGE_FUNCS 128
+#define MAX_BRIDGE_FUNCS 256
 
 /* Bridge registry */
 static uint32_t g_bridge_count = 0;
@@ -92,6 +92,22 @@ B(96)  B(97)  B(98)  B(99)  B(100) B(101) B(102) B(103)
 B(104) B(105) B(106) B(107) B(108) B(109) B(110) B(111)
 B(112) B(113) B(114) B(115) B(116) B(117) B(118) B(119)
 B(120) B(121) B(122) B(123) B(124) B(125) B(126) B(127)
+B(128) B(129) B(130) B(131) B(132) B(133) B(134) B(135)
+B(136) B(137) B(138) B(139) B(140) B(141) B(142) B(143)
+B(144) B(145) B(146) B(147) B(148) B(149) B(150) B(151)
+B(152) B(153) B(154) B(155) B(156) B(157) B(158) B(159)
+B(160) B(161) B(162) B(163) B(164) B(165) B(166) B(167)
+B(168) B(169) B(170) B(171) B(172) B(173) B(174) B(175)
+B(176) B(177) B(178) B(179) B(180) B(181) B(182) B(183)
+B(184) B(185) B(186) B(187) B(188) B(189) B(190) B(191)
+B(192) B(193) B(194) B(195) B(196) B(197) B(198) B(199)
+B(200) B(201) B(202) B(203) B(204) B(205) B(206) B(207)
+B(208) B(209) B(210) B(211) B(212) B(213) B(214) B(215)
+B(216) B(217) B(218) B(219) B(220) B(221) B(222) B(223)
+B(224) B(225) B(226) B(227) B(228) B(229) B(230) B(231)
+B(232) B(233) B(234) B(235) B(236) B(237) B(238) B(239)
+B(240) B(241) B(242) B(243) B(244) B(245) B(246) B(247)
+B(248) B(249) B(250) B(251) B(252) B(253) B(254) B(255)
 
 #undef B
 
@@ -113,6 +129,22 @@ static bridge_fn_t g_bridge_fns[MAX_BRIDGE_FUNCS] = {
     bfn_104, bfn_105, bfn_106, bfn_107, bfn_108, bfn_109, bfn_110, bfn_111,
     bfn_112, bfn_113, bfn_114, bfn_115, bfn_116, bfn_117, bfn_118, bfn_119,
     bfn_120, bfn_121, bfn_122, bfn_123, bfn_124, bfn_125, bfn_126, bfn_127,
+    bfn_128, bfn_129, bfn_130, bfn_131, bfn_132, bfn_133, bfn_134, bfn_135,
+    bfn_136, bfn_137, bfn_138, bfn_139, bfn_140, bfn_141, bfn_142, bfn_143,
+    bfn_144, bfn_145, bfn_146, bfn_147, bfn_148, bfn_149, bfn_150, bfn_151,
+    bfn_152, bfn_153, bfn_154, bfn_155, bfn_156, bfn_157, bfn_158, bfn_159,
+    bfn_160, bfn_161, bfn_162, bfn_163, bfn_164, bfn_165, bfn_166, bfn_167,
+    bfn_168, bfn_169, bfn_170, bfn_171, bfn_172, bfn_173, bfn_174, bfn_175,
+    bfn_176, bfn_177, bfn_178, bfn_179, bfn_180, bfn_181, bfn_182, bfn_183,
+    bfn_184, bfn_185, bfn_186, bfn_187, bfn_188, bfn_189, bfn_190, bfn_191,
+    bfn_192, bfn_193, bfn_194, bfn_195, bfn_196, bfn_197, bfn_198, bfn_199,
+    bfn_200, bfn_201, bfn_202, bfn_203, bfn_204, bfn_205, bfn_206, bfn_207,
+    bfn_208, bfn_209, bfn_210, bfn_211, bfn_212, bfn_213, bfn_214, bfn_215,
+    bfn_216, bfn_217, bfn_218, bfn_219, bfn_220, bfn_221, bfn_222, bfn_223,
+    bfn_224, bfn_225, bfn_226, bfn_227, bfn_228, bfn_229, bfn_230, bfn_231,
+    bfn_232, bfn_233, bfn_234, bfn_235, bfn_236, bfn_237, bfn_238, bfn_239,
+    bfn_240, bfn_241, bfn_242, bfn_243, bfn_244, bfn_245, bfn_246, bfn_247,
+    bfn_248, bfn_249, bfn_250, bfn_251, bfn_252, bfn_253, bfn_254, bfn_255,
 };
 
 /* Build raw API signature string from WASMFuncType */
@@ -173,6 +205,8 @@ register_bridge_imports(wasm_module_t module,
         if (strcmp(fi->module_name, "wasi_snapshot_preview1") == 0)
             continue;
 
+        /* env and emnapi are bridged dynamically — no skip */
+
         if (g_bridge_count >= MAX_BRIDGE_FUNCS) {
             fprintf(stderr, "wasmkernel: too many bridge imports (max %d)\n",
                     MAX_BRIDGE_FUNCS);
@@ -216,8 +250,14 @@ register_bridge_imports(wasm_module_t module,
                 count++;
         }
 
-        /* Build NativeSymbol array for this module (use static to avoid heap issues) */
-        static NativeSymbol syms[MAX_BRIDGE_FUNCS];
+        /* Allocate NativeSymbol array for this module — WAMR holds a pointer
+           to this array, so it must outlive the module (we intentionally leak). */
+        NativeSymbol *syms = (NativeSymbol *)malloc(count * sizeof(NativeSymbol));
+        if (!syms) {
+            fprintf(stderr, "wasmkernel: OOM allocating bridge for '%s'\n",
+                    g_bridge_module_names[i]);
+            continue;
+        }
 
         uint32_t si = 0;
         for (uint32_t j = i; j < g_bridge_count && si < count; j++) {
@@ -236,8 +276,6 @@ register_bridge_imports(wasm_module_t module,
             fprintf(stderr, "wasmkernel: failed to register bridge for '%s' (%d funcs)\n",
                     g_bridge_module_names[i], count);
         }
-        /* Note: syms must stay alive — WAMR references it.
-           We leak intentionally (loaded once per guest). */
     }
 }
 
@@ -346,9 +384,8 @@ wasi_fd_seek(wasm_exec_env_t exec_env, uint64 *args)
 static void
 wasi_fd_close(wasm_exec_env_t exec_env, uint64 *args)
 {
-    native_raw_return_type(uint32, args);
-    (void)exec_env;
-    native_raw_set_return(0);
+    /* Bridge to host via slot 208 */
+    bridge_dispatch(208, exec_env, args);
 }
 
 /* fd_fdstat_get(fd: i32, buf: i32) -> i32 */
@@ -370,17 +407,22 @@ wasi_fd_fdstat_get(wasm_exec_env_t exec_env, uint64 *args)
         uint64_t rights = 0xFFFFFFFFFFFFFFFFULL;
         memcpy(buf + 8, &rights, 8);
         memcpy(buf + 16, &rights, 8);
+    } else {
+        /* For preopened dirs and opened fds — grant all rights */
+        buf[0] = 3; /* DIRECTORY */
+        uint64_t rights = 0xFFFFFFFFFFFFFFFFULL;
+        memcpy(buf + 8, &rights, 8);
+        memcpy(buf + 16, &rights, 8);
     }
     native_raw_set_return(0);
 }
 
-/* fd_prestat_get -> BADF */
+/* fd_prestat_get — bridged to host for preopen support */
 static void
 wasi_fd_prestat_get(wasm_exec_env_t exec_env, uint64 *args)
 {
-    native_raw_return_type(uint32, args);
-    (void)exec_env;
-    native_raw_set_return(8);
+    /* Bridge to host via slot 126 */
+    bridge_dispatch(207, exec_env, args);
 }
 
 /* proc_exit(code: i32) */
@@ -573,7 +615,7 @@ wasi_sched_yield(wasm_exec_env_t exec_env, uint64 *args)
 
 static NativeSymbol g_wasi_symbols[] = {
     { "fd_write",           (void *)wasi_fd_write,           "(iiii)i",  NULL },
-    { "fd_read",            (void *)wasi_fd_read,            "(iiii)i",  NULL },
+    { "fd_read",            (void *)bfn_200,                 "(iiii)i",  NULL },
     { "fd_seek",            (void *)wasi_fd_seek,            "(iIii)i",  NULL },
     { "fd_close",           (void *)wasi_fd_close,           "(i)i",     NULL },
     { "fd_fdstat_get",      (void *)wasi_fd_fdstat_get,      "(ii)i",    NULL },
@@ -587,12 +629,12 @@ static NativeSymbol g_wasi_symbols[] = {
     { "poll_oneoff",        (void *)wasi_poll_oneoff,        "(iiii)i",  NULL },
     { "sched_yield",        (void *)wasi_sched_yield,        "()i",      NULL },
     /* Filesystem/misc stubs — bridged to host via slots 120-127 */
-    { "path_open",          (void *)bfn_120,    "(iiiiiIiii)i", NULL },
-    { "fd_readdir",         (void *)bfn_121,    "(iiiIi)i",     NULL },
-    { "fd_filestat_get",    (void *)bfn_122,    "(ii)i",        NULL },
-    { "path_filestat_get",  (void *)bfn_123,    "(iiiii)i",     NULL },
-    { "fd_prestat_dir_name",(void *)bfn_124,    "(iii)i",       NULL },
-    { "random_get",         (void *)bfn_125,    "(ii)i",        NULL },
+    { "path_open",          (void *)bfn_201,    "(iiiiiIIii)i", NULL },
+    { "fd_readdir",         (void *)bfn_202,    "(iiiIi)i",     NULL },
+    { "fd_filestat_get",    (void *)bfn_203,    "(ii)i",        NULL },
+    { "path_filestat_get",  (void *)bfn_204,    "(iiiii)i",     NULL },
+    { "fd_prestat_dir_name",(void *)bfn_205,    "(iii)i",       NULL },
+    { "random_get",         (void *)bfn_206,    "(ii)i",        NULL },
 };
 
 #define NUM_WASI_SYMBOLS (sizeof(g_wasi_symbols) / sizeof(NativeSymbol))
@@ -625,89 +667,12 @@ kernel_init(void)
         return;
     }
 
-    /* Pre-register env.napi functions for modules that import them.
-     * IMPORTANT: This table is already sorted alphabetically because
-     * WAMR's register_natives sorts it and uses binary search. The bridge
-     * slot (bfn_N) index matches the sorted position, so the host's
-     * bridge discovery (kernel_bridge_info) returns them in the same order. */
-    {
-        static NativeSymbol env_napi[] = {
-            { "napi_call_function",              (void *)bfn_0,  "(iiiiii)i", NULL },
-            { "napi_coerce_to_object",           (void *)bfn_1,  "(iii)i",    NULL },
-            { "napi_coerce_to_string",           (void *)bfn_2,  "(iii)i",    NULL },
-            { "napi_create_array_with_length",   (void *)bfn_3,  "(iii)i",    NULL },
-            { "napi_create_error",               (void *)bfn_4,  "(iiii)i",   NULL },
-            { "napi_create_function",            (void *)bfn_5,  "(iiiiii)i", NULL },
-            { "napi_create_int64",               (void *)bfn_6,  "(iIi)i",    NULL },
-            { "napi_create_object",              (void *)bfn_7,  "(ii)i",     NULL },
-            { "napi_create_reference",           (void *)bfn_8,  "(iiii)i",   NULL },
-            { "napi_create_string_utf8",         (void *)bfn_9,  "(iiii)i",   NULL },
-            { "napi_create_threadsafe_function", (void *)bfn_10, "(iiiiiiiiiii)i", NULL },
-            { "napi_define_class",               (void *)bfn_11, "(iiiiiiii)i",    NULL },
-            { "napi_delete_reference",           (void *)bfn_12, "(ii)i",     NULL },
-            { "napi_get_and_clear_last_exception",(void *)bfn_13,"(ii)i",     NULL },
-            { "napi_get_array_length",           (void *)bfn_14, "(iii)i",    NULL },
-            { "napi_get_cb_info",                (void *)bfn_15, "(iiiiii)i", NULL },
-            { "napi_get_element",                (void *)bfn_16, "(iiii)i",   NULL },
-            { "napi_get_global",                 (void *)bfn_17, "(ii)i",     NULL },
-            { "napi_get_named_property",         (void *)bfn_18, "(iiii)i",   NULL },
-            { "napi_get_property",               (void *)bfn_19, "(iiii)i",   NULL },
-            { "napi_get_reference_value",        (void *)bfn_20, "(iii)i",    NULL },
-            { "napi_get_undefined",              (void *)bfn_21, "(ii)i",     NULL },
-            { "napi_get_value_bool",             (void *)bfn_22, "(iii)i",    NULL },
-            { "napi_get_value_string_utf8",      (void *)bfn_23, "(iiiii)i",  NULL },
-            { "napi_is_array",                   (void *)bfn_24, "(iii)i",    NULL },
-            { "napi_is_error",                   (void *)bfn_25, "(iii)i",    NULL },
-            { "napi_is_exception_pending",       (void *)bfn_26, "(ii)i",     NULL },
-            { "napi_reference_unref",            (void *)bfn_27, "(iii)i",    NULL },
-            { "napi_set_element",                (void *)bfn_28, "(iiii)i",   NULL },
-            { "napi_set_named_property",         (void *)bfn_29, "(iiii)i",   NULL },
-            { "napi_set_property",               (void *)bfn_30, "(iiii)i",   NULL },
-            { "napi_throw",                      (void *)bfn_31, "(ii)i",     NULL },
-            { "napi_throw_error",                (void *)bfn_32, "(iii)i",    NULL },
-            { "napi_typeof",                     (void *)bfn_33, "(iii)i",    NULL },
-            { "napi_unref_threadsafe_function",  (void *)bfn_34, "(ii)i",     NULL },
-            { "napi_unwrap",                     (void *)bfn_35, "(iii)i",    NULL },
-            { "napi_wrap",                       (void *)bfn_36, "(iiiiii)i", NULL },
-        };
-        /* Also populate bridge metadata so host can discover these via
-           kernel_bridge_info. Use same indices as bfn_N. */
-        static const char *env_names[] = {
-            "napi_call_function", "napi_coerce_to_object", "napi_coerce_to_string",
-            "napi_create_array_with_length", "napi_create_error", "napi_create_function",
-            "napi_create_int64", "napi_create_object", "napi_create_reference",
-            "napi_create_string_utf8", "napi_create_threadsafe_function",
-            "napi_define_class", "napi_delete_reference",
-            "napi_get_and_clear_last_exception", "napi_get_array_length",
-            "napi_get_cb_info", "napi_get_element", "napi_get_global",
-            "napi_get_named_property", "napi_get_property", "napi_get_reference_value",
-            "napi_get_undefined", "napi_get_value_bool", "napi_get_value_string_utf8",
-            "napi_is_array", "napi_is_error", "napi_is_exception_pending",
-            "napi_reference_unref", "napi_set_element", "napi_set_named_property",
-            "napi_set_property", "napi_throw", "napi_throw_error", "napi_typeof",
-            "napi_unref_threadsafe_function", "napi_unwrap", "napi_wrap",
-        };
-        uint32_t n_env = sizeof(env_napi) / sizeof(NativeSymbol);
-        for (uint32_t i = 0; i < n_env; i++) {
-            strncpy(g_bridge_module_names[i], "env", 63);
-            strncpy(g_bridge_field_names[i], env_names[i], 63);
-            /* Parse param count from signature string */
-            const char *sig = env_napi[i].signature;
-            uint32_t pc = 0;
-            if (sig) {
-                const char *p = sig;
-                if (*p == '(') p++;
-                while (*p && *p != ')') { pc++; p++; }
-            }
-            g_bridge_param_counts[i] = pc;
-            g_bridge_has_return[i] = true;
-        }
-        g_bridge_count = n_env; /* 37 */
-
-        if (!wasm_runtime_register_natives_raw("env", env_napi, n_env)) {
-            fprintf(stderr, "kernel_init: failed to register env.napi\n");
-        }
-    }
+    /* All env.* and emnapi.* functions are registered dynamically by
+     * register_bridge_imports() during kernel_load(). WAMR's native symbol
+     * registry is a linked list — multiple registrations for the same module
+     * accumulate, so this works alongside the WASI table registered above.
+     * No static table needed — any function the guest imports gets a bridge
+     * handler automatically, and the host provides the JS implementation. */
 
     g_initialized = true;
 }
@@ -752,23 +717,31 @@ kernel_load(uint32_t wasm_ptr, uint32_t wasm_len)
        import the kernel doesn't handle internally */
     register_bridge_imports(g_guest_module, g_wasi_symbols, NUM_WASI_SYMBOLS);
 
+    /* Re-resolve imports — bridge natives were registered AFTER wasm_runtime_load
+       already tried (and failed) to resolve env/emnapi imports */
+    extern bool wasm_resolve_symbols(WASMModule *module);
+    wasm_resolve_symbols((WASMModule *)g_guest_module);
+
     /* Register bridge metadata for WASI filesystem stubs (slots 120-127)
        so the host can discover them via kernel_bridge_info.
        Must be AFTER register_bridge_imports which resets g_bridge_count. */
     {
-        static const struct { uint32_t slot; const char *name; } wasi_bridge[] = {
-            { 120, "path_open" },
-            { 121, "fd_readdir" },
-            { 122, "fd_filestat_get" },
-            { 123, "path_filestat_get" },
-            { 124, "fd_prestat_dir_name" },
-            { 125, "random_get" },
+        static const struct { uint32_t slot; const char *name; uint16_t nparams; } wasi_bridge[] = {
+            { 200, "fd_read",            4 },
+            { 201, "path_open",          9 },
+            { 202, "fd_readdir",         5 },
+            { 203, "fd_filestat_get",    2 },
+            { 204, "path_filestat_get",  5 },
+            { 205, "fd_prestat_dir_name",3 },
+            { 206, "random_get",         2 },
+            { 207, "fd_prestat_get",     2 },
+            { 208, "fd_close",           1 },
         };
         for (uint32_t i = 0; i < sizeof(wasi_bridge)/sizeof(wasi_bridge[0]); i++) {
             uint32_t s = wasi_bridge[i].slot;
             strncpy(g_bridge_module_names[s], "wasi_snapshot_preview1", 63);
             strncpy(g_bridge_field_names[s], wasi_bridge[i].name, 63);
-            g_bridge_param_counts[s] = 2;
+            g_bridge_param_counts[s] = wasi_bridge[i].nparams;
             g_bridge_has_return[s] = true;
             if (s >= g_bridge_count) g_bridge_count = s + 1;
         }
@@ -863,6 +836,7 @@ kernel_call(uint32_t func_name_ptr, uint32_t argv_ptr, uint32_t argc)
 
     /* Call directly (single-shot, no scheduling needed for short calls) */
     uint32_t *argv = argv_ptr ? (uint32_t *)(uintptr_t)argv_ptr : NULL;
+    g_guest_exec_env->instructions_to_execute = 100000000;
     if (!wasm_runtime_call_wasm(g_guest_exec_env, func, argc, argv)) {
         const char *exc = wasm_runtime_get_exception(g_guest_instance);
         if (exc) {
@@ -889,6 +863,8 @@ kernel_call_indirect(uint32_t table_idx, uint32_t argc, uint32_t argv_ptr)
         return -1;
 
     uint32_t *argv = argv_ptr ? (uint32_t *)(uintptr_t)argv_ptr : NULL;
+    /* Ensure plenty of fuel for direct calls */
+    g_guest_exec_env->instructions_to_execute = 100000000;
     if (!wasm_runtime_call_indirect(g_guest_exec_env, table_idx, argc, argv)) {
         const char *exc = wasm_runtime_get_exception(g_guest_instance);
         if (exc) {

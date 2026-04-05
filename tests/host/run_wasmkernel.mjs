@@ -89,17 +89,14 @@ const hostImports = {
       return 0n;
     }
 
-    // Read raw args (each is uint64 = 8 bytes)
-    const dv = getKernelMemory();
+    // Read raw args — fresh DataView each iteration (memory may grow)
     const args = [];
     for (let i = 0; i < argc; i++) {
-      // Read as two u32s (little-endian) to get full u64
-      const lo = dv.getUint32(argsPtr + i * 8, true);
-      const hi = dv.getUint32(argsPtr + i * 8 + 4, true);
+      const lo = new DataView(k.memory.buffer).getUint32(argsPtr + i * 8, true);
       args.push(lo); // Most WASI args are i32; pass lo for now
     }
 
-    const result = handler(args);
+    const result = handler(args, argsPtr);
     return typeof result === "bigint" ? result : BigInt(result ?? 0);
   },
 
@@ -172,7 +169,7 @@ if (bridgeCount > 0) {
     } else if (moduleName === "env" && napiRuntime[fieldName]) {
       // N-API function — dispatch to our napi runtime
       const fname = fieldName;
-      bridgeFunctions.set(i, (args) => napiRuntime.dispatch(fname, args));
+      bridgeFunctions.set(i, (args, argsPtr) => napiRuntime.dispatch(fname, args, argsPtr));
     } else {
       console.error(`bridge[${i}]: ${moduleName}.${fieldName} (unimplemented)`);
       bridgeFunctions.set(i, () => 0n);
