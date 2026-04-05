@@ -450,6 +450,7 @@ export class NapiRuntime {
 
   napi_get_value_bool(args) {
     const [env, valueHandle, resultPtr] = args;
+    if (!valueHandle || !resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
     if (typeof val !== 'boolean') return napi_boolean_expected;
     this._writeU32(resultPtr, val ? 1 : 0);
@@ -633,6 +634,7 @@ export class NapiRuntime {
   // napi_get_value_int32(env, value, result_ptr)
   napi_get_value_int32(args) {
     const [env, valueHandle, resultPtr] = args;
+    if (!valueHandle || !resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
     if (typeof val !== 'number') return napi_number_expected;
     const base = this._guestBase();
@@ -643,6 +645,7 @@ export class NapiRuntime {
   // napi_get_value_uint32(env, value, result_ptr)
   napi_get_value_uint32(args) {
     const [env, valueHandle, resultPtr] = args;
+    if (!valueHandle || !resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
     if (typeof val !== 'number') return napi_number_expected;
     this._writeU32(resultPtr, Number(val) >>> 0);
@@ -652,16 +655,28 @@ export class NapiRuntime {
   // napi_get_value_int64(env, value, result_ptr)
   napi_get_value_int64(args) {
     const [env, valueHandle, resultPtr] = args;
+    if (!valueHandle || !resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
     if (typeof val !== 'number') return napi_number_expected;
     const base = this._guestBase();
-    new DataView(this._buf()).setBigInt64(base + resultPtr, BigInt(Math.trunc(Number(val))), true);
+    // Convert to int64 via BigInt — setBigInt64 handles wrapping naturally
+    let i64val;
+    const trunc = Math.trunc(val);
+    if (!Number.isFinite(trunc)) {
+      i64val = 0n;
+    } else {
+      // BigInt(trunc) may exceed int64 range for very large floats;
+      // setBigInt64 wraps naturally (mod 2^64) which matches V8 behavior
+      try { i64val = BigInt(trunc); } catch { i64val = 0n; }
+    }
+    new DataView(this._buf()).setBigInt64(base + resultPtr, i64val, true);
     return napi_ok;
   }
 
   // napi_get_value_double(env, value, result_ptr)
   napi_get_value_double(args) {
     const [env, valueHandle, resultPtr] = args;
+    if (!valueHandle || !resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
     if (typeof val !== 'number') return napi_number_expected;
     const base = this._guestBase();
