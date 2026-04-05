@@ -993,8 +993,8 @@ export class NapiRuntime {
   }
   napi_create_external_buffer(args) {
     const [env, length, dataPtr, finalizeCb, finalizeHint, resultPtr] = args;
-    // dataPtr IS the guest memory address (external = caller owns the memory)
     const buf = this._createGuestBuffer(dataPtr, length);
+    this._registerFinalizer(buf, finalizeCb, dataPtr, finalizeHint);
     this._abMemory.set(buf, { address: dataPtr, ownership: 1, runtimeAllocated: 0 });
     const h = this._newHandle(buf);
     this._writeResult(resultPtr, h);
@@ -1107,7 +1107,15 @@ export class NapiRuntime {
     this._writeResult(resultPtr, h);
     return napi_ok;
   }
-  node_api_post_finalizer(args) { return napi_ok; }
+  node_api_post_finalizer(args) {
+    const [env, cb, data, hint] = args;
+    if (cb) {
+      // Queue the callback — will be drained on next dispatch
+      this._postedFinalizers.push({ cb, data, hint });
+      this._postedFinalizersPending = true;
+    }
+    return napi_ok;
+  }
   node_api_is_sharedarraybuffer(args) {
     const [env, valueHandle, resultPtr] = args;
     const val = this._getHandle(valueHandle);
@@ -1121,6 +1129,7 @@ export class NapiRuntime {
   napi_create_external_arraybuffer(args) {
     const [env, dataPtr, byteLength, finalizeCb, finalizeHint, resultPtr] = args;
     const ab = new ArrayBuffer(byteLength);
+    this._registerFinalizer(ab, finalizeCb, dataPtr, finalizeHint);
     const h = this._newHandle(ab);
     this._writeResult(resultPtr, h);
     return napi_ok;
