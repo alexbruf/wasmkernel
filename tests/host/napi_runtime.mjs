@@ -41,6 +41,8 @@ export class NapiRuntime {
     this._asyncWorks = new Map();
     this._nextAsyncId = 1;
     this._pendingAsyncQueue = [];
+    this._escapedScopes = new Set();
+    this._abMemory = new WeakMap();
 
     // Pre-register env handle
     this.handles.set(1, { type: 'env' });
@@ -485,8 +487,9 @@ export class NapiRuntime {
     const [env, codePtr, msgPtr] = args;
     const code = codePtr ? this._readNullTermString(codePtr) : '';
     const msg = msgPtr ? this._readNullTermString(msgPtr) : 'unknown error';
-    console.error(`  napi_throw_error: code='${code}' msg='${msg}'`);
-    this.lastException = new Error(`${code}: ${msg}`);
+    const err = new Error(msg);
+    if (code) err.code = code;
+    this.lastException = err;
     this.exceptionPending = true;
     return napi_ok;
   }
@@ -742,7 +745,10 @@ export class NapiRuntime {
   napi_create_buffer(args) {
     const [env, length, dataPtr, resultPtr] = args;
     const buf = Buffer.alloc(length);
-    if (dataPtr) this._writeU32(dataPtr, 0); // data pointer not meaningful in our bridge
+    // Allocate guest memory so native code can write to it
+    const guestPtr = length > 0 ? this.k.kernel_alloc(length) : 0;
+    this._abMemory.set(buf.buffer, { address: guestPtr, ownership: 1, runtimeAllocated: 1 });
+    if (dataPtr) this._writeU32(dataPtr, guestPtr);
     const h = this._newHandle(buf);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -752,7 +758,13 @@ export class NapiRuntime {
     const base = this._guestBase();
     const src = new Uint8Array(this._buf(), base + dataGuestPtr, length);
     const buf = Buffer.from(src);
-    if (dataPtrOut) this._writeU32(dataPtrOut, 0);
+    // Allocate guest memory for the copy
+    const guestPtr = length > 0 ? this.k.kernel_alloc(length) : 0;
+    if (guestPtr) {
+      new Uint8Array(this._buf()).set(new Uint8Array(buf.buffer, buf.byteOffset, length), base + guestPtr);
+    }
+    this._abMemory.set(buf.buffer, { address: guestPtr, ownership: 1, runtimeAllocated: 1 });
+    if (dataPtrOut) this._writeU32(dataPtrOut, guestPtr);
     const h = this._newHandle(buf);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -760,6 +772,8 @@ export class NapiRuntime {
   napi_create_external_buffer(args) {
     const [env, length, dataPtr, finalizeCb, finalizeHint, resultPtr] = args;
     const buf = Buffer.alloc(length);
+    // Track guest memory address
+    this._abMemory.set(buf.buffer, { address: dataPtr, ownership: 1, runtimeAllocated: 0 });
     const h = this._newHandle(buf);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -1079,20 +1093,24 @@ export class NapiRuntime {
       }
       if (!propName) continue;
 
+      // napi_property_attributes: writable=1, enumerable=2, configurable=4
+      const writable = !!(attributes & 1);
+      const enumerable = !!(attributes & 2);
+      const configurable = !!(attributes & 4);
+
       if (methodCb) {
         const fn = this._makeCallbackFunction(methodCb, propData);
         Object.defineProperty(target, propName, {
-          value: fn, writable: !!(attributes & 4), enumerable: !!(attributes & 2), configurable: !!(attributes & 1),
+          value: fn, writable, enumerable, configurable,
         });
       } else if (getterCb || setterCb) {
-        const desc = { enumerable: !!(attributes & 2), configurable: !!(attributes & 1) };
+        const desc = { enumerable, configurable };
         if (getterCb) desc.get = this._makeCallbackFunction(getterCb, propData);
         if (setterCb) desc.set = this._makeCallbackFunction(setterCb, propData);
         Object.defineProperty(target, propName, desc);
       } else if (valueHandle) {
         Object.defineProperty(target, propName, {
-          value: this._getHandle(valueHandle), writable: !!(attributes & 4),
-          enumerable: !!(attributes & 2), configurable: !!(attributes & 1),
+          value: this._getHandle(valueHandle), writable, enumerable, configurable,
         });
       }
     }
@@ -1416,13 +1434,27 @@ export class NapiRuntime {
     return napi_ok;
   }
 
-  // napi_open_handle_scope / napi_close_handle_scope — no-ops in our implementation
+  // Handle scopes — track escapable scopes to detect double-escape
+  _escapedScopes = new Set();
   napi_open_handle_scope(args) { return napi_ok; }
   napi_close_handle_scope(args) { return napi_ok; }
-  napi_open_escapable_handle_scope(args) { return napi_ok; }
-  napi_close_escapable_handle_scope(args) { return napi_ok; }
+  napi_open_escapable_handle_scope(args) {
+    const [env, resultPtr] = args;
+    const scopeId = this._nextRef++;
+    this._writeU32(resultPtr, scopeId);
+    return napi_ok;
+  }
+  napi_close_escapable_handle_scope(args) {
+    const [env, scope] = args;
+    this._escapedScopes.delete(scope);
+    return napi_ok;
+  }
   napi_escape_handle(args) {
     const [env, scope, escapee, resultPtr] = args;
+    if (this._escapedScopes.has(scope)) {
+      return 13; // napi_escape_called_twice
+    }
+    this._escapedScopes.add(scope);
     this._writeResult(resultPtr, escapee);
     return napi_ok;
   }

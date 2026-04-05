@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env node --expose-gc
 /**
  * Run emnapi's actual test JS files against WasmKernel.
  * Uses their real assertions, not our defensive wrappers.
