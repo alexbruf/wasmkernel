@@ -1003,6 +1003,7 @@ export class NapiRuntime {
   napi_get_buffer_info(args) {
     const [env, valueHandle, dataPtr, lengthPtr] = args;
     const val = this._getHandle(valueHandle);
+    if (!Buffer.isBuffer(val) && !val?._isGuestBuffer) return napi_invalid_arg;
     const info = this._abMemory.get(val);
     if (dataPtr) this._writeU32(dataPtr, info?.address ?? 0);
     if (lengthPtr) this._writeU32(lengthPtr, val?.length ?? val?.byteLength ?? 0);
