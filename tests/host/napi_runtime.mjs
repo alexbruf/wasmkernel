@@ -471,8 +471,14 @@ export class NapiRuntime {
     const [env, valueHandle, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
-    const h = this._newHandle(String(val ?? ''));
-    this._writeResult(resultPtr, h);
+    try {
+      const h = this._newHandle(String(val));
+      this._writeResult(resultPtr, h);
+    } catch (e) {
+      this.lastException = e;
+      this.exceptionPending = true;
+      return napi_pending_exception;
+    }
     return napi_ok;
   }
 
@@ -535,6 +541,7 @@ export class NapiRuntime {
     if (!resultPtr) return napi_invalid_arg;
     const msg = this._getHandle(msgHandle);
     const err = new Error(typeof msg === 'string' ? msg : String(msg));
+    if (codeHandle) { const code = this._getHandle(codeHandle); if (code) err.code = code; }
     const h = this._newHandle(err);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -1311,8 +1318,14 @@ export class NapiRuntime {
     const [env, valueHandle, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
-    const h = this._newHandle(Number(val));
-    this._writeResult(resultPtr, h);
+    try {
+      const h = this._newHandle(Number(val));
+      this._writeResult(resultPtr, h);
+    } catch (e) {
+      this.lastException = e;
+      this.exceptionPending = true;
+      return napi_pending_exception;
+    }
     return napi_ok;
   }
 
