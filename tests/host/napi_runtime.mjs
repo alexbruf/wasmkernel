@@ -167,7 +167,8 @@ export class NapiRuntime {
   napi_get_value_string_utf8(args) {
     const [env, valueHandle, bufPtr, bufSize, resultPtr] = args;
     const value = this._getHandle(valueHandle);
-    const str = String(value ?? '');
+    if (typeof value !== 'string') return napi_string_expected;
+    const str = value;
     if (bufPtr && bufSize > 0) {
       const written = this._writeString(bufPtr, bufSize - 1, str);
       // Null-terminate
@@ -450,6 +451,7 @@ export class NapiRuntime {
   napi_get_value_bool(args) {
     const [env, valueHandle, resultPtr] = args;
     const val = this._getHandle(valueHandle);
+    if (typeof val !== 'boolean') return napi_boolean_expected;
     this._writeU32(resultPtr, val ? 1 : 0);
     return napi_ok;
   }
@@ -632,6 +634,7 @@ export class NapiRuntime {
   napi_get_value_int32(args) {
     const [env, valueHandle, resultPtr] = args;
     const val = this._getHandle(valueHandle);
+    if (typeof val !== 'number') return napi_number_expected;
     const base = this._guestBase();
     new DataView(this._buf()).setInt32(base + resultPtr, Number(val) | 0, true);
     return napi_ok;
@@ -641,6 +644,7 @@ export class NapiRuntime {
   napi_get_value_uint32(args) {
     const [env, valueHandle, resultPtr] = args;
     const val = this._getHandle(valueHandle);
+    if (typeof val !== 'number') return napi_number_expected;
     this._writeU32(resultPtr, Number(val) >>> 0);
     return napi_ok;
   }
@@ -649,6 +653,7 @@ export class NapiRuntime {
   napi_get_value_int64(args) {
     const [env, valueHandle, resultPtr] = args;
     const val = this._getHandle(valueHandle);
+    if (typeof val !== 'number') return napi_number_expected;
     const base = this._guestBase();
     new DataView(this._buf()).setBigInt64(base + resultPtr, BigInt(Math.trunc(Number(val))), true);
     return napi_ok;
@@ -658,6 +663,7 @@ export class NapiRuntime {
   napi_get_value_double(args) {
     const [env, valueHandle, resultPtr] = args;
     const val = this._getHandle(valueHandle);
+    if (typeof val !== 'number') return napi_number_expected;
     const base = this._guestBase();
     new DataView(this._buf()).setFloat64(base + resultPtr, Number(val), true);
     return napi_ok;
