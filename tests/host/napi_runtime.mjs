@@ -44,13 +44,18 @@ export class NapiRuntime {
     this.nextRef = 1;
     this.lastException = null;
     this.exceptionPending = false;
-    this.wraps = new Map();  // handle_id -> wrapped data
+    this.wraps = new WeakMap();  // JS object -> native ptr (weak to allow GC)
     this.cbInfoStack = [];   // for napi_get_cb_info
     this._asyncWorks = new Map();
     this._nextAsyncId = 1;
     this._pendingAsyncQueue = [];
     this._escapedScopes = new Set();
     this._abMemory = new WeakMap();
+
+    // Handle scopes: track which handles to release when a callback returns
+    this._scopeStack = [];        // stack of nextHandle values at scope entry
+    this._referencedHandles = new Set(); // handles kept alive by napi_create_reference
+    this._escapedHandleIds = new Set();  // handles escaped from their scope
 
     // FinalizationRegistry for calling C destructors when JS GC collects handles
     this._postedFinalizers = [];
@@ -95,6 +100,20 @@ export class NapiRuntime {
       } catch {}
     }
     this._postedFinalizersPending = false;
+  }
+
+  _pushScope() {
+    this._scopeStack.push(this.nextHandle);
+  }
+
+  _popScope() {
+    const scopeStart = this._scopeStack.pop();
+    if (scopeStart === undefined) return;
+    for (let id = scopeStart; id < this.nextHandle; id++) {
+      if (this._referencedHandles.has(id)) continue;
+      if (this._escapedHandleIds.has(id)) { this._escapedHandleIds.delete(id); continue; }
+      this.handles.delete(id);
+    }
   }
 
   _newHandle(value) {
@@ -288,6 +307,7 @@ export class NapiRuntime {
   _makeCallbackFunction(tableIdx, dataPtr) {
     const self = this;
     return function(...jsArgs) {
+      self._pushScope();
       const argHandles = jsArgs.map(a => self._newHandle(a));
       const cbInfoId = self.nextHandle++;
       self.cbInfoStack.push({
@@ -300,12 +320,15 @@ export class NapiRuntime {
       self.cbInfoStack.pop();
       // Check for pending exception after guest callback
       if (self.exceptionPending) {
+        self._popScope();
         const exc = self.lastException;
         self.lastException = null;
         self.exceptionPending = false;
         throw exc;
       }
+      // Get return value BEFORE popping scope (it's in current scope)
       const retVal = self._getHandle(resultHandle);
+      self._popScope();
       // Drain any deferred async work
       if (self._pendingAsyncQueue && self._pendingAsyncQueue.length > 0) {
         self.drainAsyncQueue();
@@ -397,6 +420,8 @@ export class NapiRuntime {
     if (!resultPtr) return napi_invalid_arg;
     const refId = this.nextRef++;
     this.refs.set(refId, { handle: valueHandle, refcount: initialRefcount });
+    // Keep the handle alive across scope boundaries
+    if (initialRefcount > 0) this._referencedHandles.add(valueHandle);
     this._writeU32(resultPtr, refId);
     return napi_ok;
   }
@@ -418,6 +443,11 @@ export class NapiRuntime {
 
   napi_delete_reference(args) {
     const [env, refId] = args;
+    const ref = this.refs.get(refId);
+    if (ref) {
+      this._referencedHandles.delete(ref.handle);
+      this.handles.delete(ref.handle); // allow GC
+    }
     this.refs.delete(refId);
     return napi_ok;
   }
@@ -1672,6 +1702,7 @@ export class NapiRuntime {
       return napi_escape_called_twice;
     }
     this._escapedScopes.add(scope);
+    this._escapedHandleIds.add(escapee); // survive scope cleanup
     this._writeResult(resultPtr, escapee);
     return napi_ok;
   }
