@@ -266,7 +266,7 @@ export class NapiRuntime {
         const exc = self.lastException;
         self.lastException = null;
         self.exceptionPending = false;
-        throw exc instanceof Error ? exc : new Error(String(exc));
+        throw exc;
       }
       const retVal = self._getHandle(resultHandle);
       // Drain any deferred async work
@@ -1412,6 +1412,7 @@ export class NapiRuntime {
     const [env, objectHandle, keyHandle, resultPtr] = args;
     const obj = this._getHandle(objectHandle);
     const key = this._getHandle(keyHandle);
+    if (typeof key !== 'string' && typeof key !== 'symbol') return napi_name_expected;
     const has = obj && Object.prototype.hasOwnProperty.call(obj, key);
     this._writeU32(resultPtr, has ? 1 : 0);
     return napi_ok;
@@ -1934,9 +1935,15 @@ export class NapiRuntime {
     const [env, byteLength, abHandle, byteOffset, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
     const ab = this._getHandle(abHandle);
-    const dv = new DataView(ab, byteOffset, byteLength);
-    const h = this._newHandle(dv);
-    this._writeResult(resultPtr, h);
+    try {
+      const dv = new DataView(ab, byteOffset, byteLength);
+      const h = this._newHandle(dv);
+      this._writeResult(resultPtr, h);
+    } catch (e) {
+      this.lastException = e;
+      this.exceptionPending = true;
+      return napi_pending_exception;
+    }
     return napi_ok;
   }
 
