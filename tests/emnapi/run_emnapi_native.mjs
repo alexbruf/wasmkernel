@@ -66,6 +66,7 @@ try {
   await Promise.resolve(result);
   console.log(`PASS ${testName}`);
 } catch (e) {
-  console.error(`FAIL ${testName}: ${e.message}`);
+  console.error(`FAIL ${testName}: ${e?.message ?? e}`);
+  if (e?.stack) console.error(e.stack.split('\n').slice(0, 5).join('\n'));
   process.exit(1);
 }

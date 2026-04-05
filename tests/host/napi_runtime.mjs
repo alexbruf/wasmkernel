@@ -741,39 +741,108 @@ export class NapiRuntime {
     if (obj && proto) Object.setPrototypeOf(obj, proto);
     return napi_ok;
   }
+  // Create a live view into guest memory that acts like a Buffer.
+  // Reads/writes go directly to kernel memory — no copy needed.
+  _createGuestBuffer(guestPtr, length) {
+    const self = this;
+    // Return a Proxy around a Buffer that always reads from kernel memory
+    const target = Buffer.alloc(0); // dummy for instanceof checks
+    return new Proxy(target, {
+      get(_, prop) {
+        if (prop === Symbol.toPrimitive || prop === 'valueOf') return undefined;
+        if (prop === 'length' || prop === 'byteLength') return length;
+        if (prop === 'buffer') return self._getGuestArrayBuffer(guestPtr, length);
+        if (prop === 'byteOffset') return 0;
+        if (prop === '_guestPtr') return guestPtr;
+        if (prop === '_isGuestBuffer') return true;
+
+        // Snapshot current content for string/iteration operations
+        const snap = () => {
+          const base = self._guestBase();
+          return Buffer.from(new Uint8Array(self._buf(), base + guestPtr, length));
+        };
+
+        if (prop === 'toString') return function(enc) { return snap().toString(enc); };
+        if (prop === 'toJSON') return function() { return snap().toJSON(); };
+        if (prop === 'slice') return function(s, e) { return snap().slice(s, e); };
+        if (prop === 'copy') return function(...a) { return snap().copy(...a); };
+        if (prop === 'equals') return function(b) { return snap().equals(b); };
+        if (prop === 'compare') return function(b) { return snap().compare(b); };
+        if (prop === 'write') return function(str, off, len, enc) {
+          const b = Buffer.from(str, enc);
+          const base = self._guestBase();
+          const writeLen = Math.min(b.length, length - (off || 0));
+          new Uint8Array(self._buf()).set(b.subarray(0, writeLen), base + guestPtr + (off || 0));
+          return writeLen;
+        };
+        if (prop === Symbol.iterator) return function*() { const s = snap(); for (const b of s) yield b; };
+        if (typeof prop === 'string' && /^\d+$/.test(prop)) {
+          const idx = Number(prop);
+          if (idx >= 0 && idx < length) {
+            return new Uint8Array(self._buf())[self._guestBase() + guestPtr + idx];
+          }
+          return undefined;
+        }
+        // Fall through to Buffer prototype
+        const snapBuf = snap();
+        const v = snapBuf[prop];
+        if (typeof v === 'function') return v.bind(snapBuf);
+        return v;
+      },
+      set(_, prop, value) {
+        if (typeof prop === 'string' && /^\d+$/.test(prop)) {
+          const idx = Number(prop);
+          if (idx >= 0 && idx < length) {
+            new Uint8Array(self._buf())[self._guestBase() + guestPtr + idx] = value;
+            return true;
+          }
+        }
+        return true;
+      },
+      getPrototypeOf() { return Buffer.prototype; },
+    });
+  }
+
+  _getGuestArrayBuffer(guestPtr, length) {
+    // Return a snapshot ArrayBuffer (can't proxy ArrayBuffer easily)
+    const base = this._guestBase();
+    return new Uint8Array(this._buf(), base + guestPtr, length).buffer.slice(
+      base + guestPtr, base + guestPtr + length
+    );
+  }
+
   // ===== Buffer API =====
   napi_create_buffer(args) {
     const [env, length, dataPtr, resultPtr] = args;
-    const buf = Buffer.alloc(length);
-    // Allocate guest memory so native code can write to it
     const guestPtr = length > 0 ? this.k.kernel_alloc(length) : 0;
-    this._abMemory.set(buf.buffer, { address: guestPtr, ownership: 1, runtimeAllocated: 1 });
     if (dataPtr) this._writeU32(dataPtr, guestPtr);
+    const buf = this._createGuestBuffer(guestPtr, length);
+    this._abMemory.set(buf, { address: guestPtr, ownership: 1, runtimeAllocated: 1 });
     const h = this._newHandle(buf);
     this._writeResult(resultPtr, h);
     return napi_ok;
   }
   napi_create_buffer_copy(args) {
     const [env, length, dataGuestPtr, dataPtrOut, resultPtr] = args;
-    const base = this._guestBase();
-    const src = new Uint8Array(this._buf(), base + dataGuestPtr, length);
-    const buf = Buffer.from(src);
-    // Allocate guest memory for the copy
     const guestPtr = length > 0 ? this.k.kernel_alloc(length) : 0;
-    if (guestPtr) {
-      new Uint8Array(this._buf()).set(new Uint8Array(buf.buffer, buf.byteOffset, length), base + guestPtr);
+    if (guestPtr && dataGuestPtr) {
+      // Copy source data to new allocation in guest memory
+      const base = this._guestBase();
+      const mem = new Uint8Array(this._buf());
+      mem.copyWithin(base + guestPtr, base + dataGuestPtr, base + dataGuestPtr + length);
     }
-    this._abMemory.set(buf.buffer, { address: guestPtr, ownership: 1, runtimeAllocated: 1 });
     if (dataPtrOut) this._writeU32(dataPtrOut, guestPtr);
+    const buf = this._createGuestBuffer(guestPtr, length);
+    this._abMemory.set(buf, { address: guestPtr, ownership: 1, runtimeAllocated: 1 });
     const h = this._newHandle(buf);
     this._writeResult(resultPtr, h);
     return napi_ok;
   }
   napi_create_external_buffer(args) {
     const [env, length, dataPtr, finalizeCb, finalizeHint, resultPtr] = args;
-    const buf = Buffer.alloc(length);
-    // Track guest memory address
-    this._abMemory.set(buf.buffer, { address: dataPtr, ownership: 1, runtimeAllocated: 0 });
+    // dataPtr IS the guest memory address (external = caller owns the memory)
+    const buf = this._createGuestBuffer(dataPtr, length);
+    this._abMemory.set(buf, { address: dataPtr, ownership: 1, runtimeAllocated: 0 });
     const h = this._newHandle(buf);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -781,14 +850,16 @@ export class NapiRuntime {
   napi_get_buffer_info(args) {
     const [env, valueHandle, dataPtr, lengthPtr] = args;
     const val = this._getHandle(valueHandle);
-    if (dataPtr) this._writeU32(dataPtr, 0);
-    if (lengthPtr) this._writeU32(lengthPtr, Buffer.isBuffer(val) ? val.length : 0);
+    const info = this._abMemory.get(val);
+    if (dataPtr) this._writeU32(dataPtr, info?.address ?? 0);
+    if (lengthPtr) this._writeU32(lengthPtr, val?.length ?? val?.byteLength ?? 0);
     return napi_ok;
   }
   napi_is_buffer(args) {
     const [env, valueHandle, resultPtr] = args;
     const val = this._getHandle(valueHandle);
-    this._writeU32(resultPtr, Buffer.isBuffer(val) ? 1 : 0);
+    const is = Buffer.isBuffer(val) || val?._isGuestBuffer === true;
+    this._writeU32(resultPtr, is ? 1 : 0);
     return napi_ok;
   }
   node_api_create_buffer_from_arraybuffer(args) {
@@ -1678,10 +1749,18 @@ export class NapiRuntime {
 
   napi_create_arraybuffer(args) {
     const [env, byteLength, dataPtr, resultPtr] = args;
-    const ab = new ArrayBuffer(byteLength);
-    // Allocate guest memory and track the mapping
+    // Allocate in guest memory — use a snapshot ArrayBuffer for JS side
     const guestPtr = byteLength > 0 ? this.k.kernel_alloc(byteLength) : 0;
-    this._abMemory.set(ab, { address: guestPtr, ownership: 1 /* kUserland */, runtimeAllocated: 1 });
+    // Zero-initialize
+    if (guestPtr) {
+      const base = this._guestBase();
+      new Uint8Array(this._buf()).fill(0, base + guestPtr, base + guestPtr + byteLength);
+    }
+    const ab = new ArrayBuffer(byteLength);
+    ab._guestPtr = guestPtr;
+    ab._guestLength = byteLength;
+    ab._kernel = this;
+    this._abMemory.set(ab, { address: guestPtr, ownership: 1, runtimeAllocated: 1 });
     if (dataPtr) this._writeU32(dataPtr, guestPtr);
     const h = this._newHandle(ab);
     this._writeResult(resultPtr, h);
