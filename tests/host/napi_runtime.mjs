@@ -1486,7 +1486,7 @@ export class NapiRuntime {
   // napi_get_version(env, result)
   napi_get_version(args) {
     const [env, resultPtr] = args;
-    this._writeU32(resultPtr, 9); // napi version 9
+    this._writeU32(resultPtr, 10); // napi version 10
     return napi_ok;
   }
 
@@ -1633,18 +1633,24 @@ export class NapiRuntime {
   napi_get_node_version(args) {
     const [env, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
-    const parts = (typeof process !== 'undefined' ? process.version : 'v0.0.0').replace('v','').split('-')[0].split('.');
-    this._writeU32(resultPtr, parseInt(parts[0]) || 0);
-    this._writeU32(resultPtr + 4, parseInt(parts[1]) || 0);
-    this._writeU32(resultPtr + 8, parseInt(parts[2]) || 0);
-    // Write release name to guest memory
-    const rel = typeof process !== 'undefined' ? (process.release?.name ?? 'node') : 'node';
-    const rp = this.k.kernel_alloc(rel.length + 1);
-    const base = this._guestBase();
-    const mem = new Uint8Array(this._buf());
-    for (let i = 0; i < rel.length; i++) mem[base + rp + i] = rel.charCodeAt(i);
-    mem[base + rp + rel.length] = 0;
-    this._writeU32(resultPtr + 12, rp);
+    // Allocate struct in guest memory (16 bytes: major, minor, patch, release_ptr)
+    if (!this._nodeVersionPtr) {
+      this._nodeVersionPtr = this.k.kernel_alloc(16);
+      const parts = (typeof process !== 'undefined' ? process.version : 'v0.0.0').replace('v','').split('-')[0].split('.');
+      const sp = this._nodeVersionPtr;
+      this._writeU32(sp, parseInt(parts[0]) || 0);
+      this._writeU32(sp + 4, parseInt(parts[1]) || 0);
+      this._writeU32(sp + 8, parseInt(parts[2]) || 0);
+      const rel = typeof process !== 'undefined' ? (process.release?.name ?? 'node') : 'node';
+      const rp = this.k.kernel_alloc(rel.length + 1);
+      const base = this._guestBase();
+      const mem = new Uint8Array(this._buf());
+      for (let i = 0; i < rel.length; i++) mem[base + rp + i] = rel.charCodeAt(i);
+      mem[base + rp + rel.length] = 0;
+      this._writeU32(sp + 12, rp);
+    }
+    // Write pointer-to-struct at resultPtr
+    this._writeU32(resultPtr, this._nodeVersionPtr);
     return napi_ok;
   }
 
