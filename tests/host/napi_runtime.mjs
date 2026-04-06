@@ -544,6 +544,12 @@ export class NapiRuntime {
     const [env, valueHandle, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
+    // V8's ToString() throws for symbols (unlike JS String())
+    if (typeof val === 'symbol') {
+      this.lastException = new TypeError('Cannot convert a Symbol value to a string');
+      this.exceptionPending = true;
+      return napi_pending_exception;
+    }
     try {
       const h = this._newHandle(String(val));
       this._writeResult(resultPtr, h);
@@ -891,7 +897,9 @@ export class NapiRuntime {
   }
   node_api_symbol_for(args) {
     const [env, descPtr, descLen, resultPtr] = args;
-    const desc = descLen === 0xFFFFFFFF ? this._readNullTermString(descPtr) : this._readString(descPtr, descLen);
+    if (!resultPtr) return napi_invalid_arg;
+    if (!descPtr && descLen > 0 && descLen !== 0xFFFFFFFF) return napi_invalid_arg;
+    const desc = !descPtr ? '' : (descLen === 0xFFFFFFFF ? this._readNullTermString(descPtr) : this._readString(descPtr, descLen));
     const sym = Symbol.for(desc);
     const h = this._newHandle(sym);
     this._writeResult(resultPtr, h);
