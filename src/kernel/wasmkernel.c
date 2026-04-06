@@ -755,10 +755,10 @@ kernel_load(uint32_t wasm_ptr, uint32_t wasm_len)
     }
 
     /* Cap guest max memory on wasm32 — we can't allocate 4GB inside
-       the kernel's own 4GB address space. 256MB is generous. */
+       the kernel's own 4GB address space. 512MB is generous. */
     {
         WASMModule *m = (WASMModule *)g_guest_module;
-        uint32_t cap = 256 * 1024 * 1024 / 65536; /* 4096 pages = 256MB */
+        uint32_t cap = 512 * 1024 * 1024 / 65536; /* 8192 pages = 512MB */
         for (uint32_t i = 0; i < m->import_memory_count; i++) {
             if (m->import_memories[i].u.memory.mem_type.max_page_count > cap)
                 m->import_memories[i].u.memory.mem_type.max_page_count = cap;
