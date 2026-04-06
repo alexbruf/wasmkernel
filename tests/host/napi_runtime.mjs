@@ -693,12 +693,13 @@ export class NapiRuntime {
     if (!resultPtr) return napi_invalid_arg;
     // Allocate error info struct in guest memory (16 bytes)
     // napi_extended_error_info: error_message(i32), engine_reserved(i32), engine_error_code(u32), error_code(i32)
-    if (!this._errorInfoPtr) {
-      this._errorInfoPtr = this.k.kernel_alloc(16);
-    }
-    const p = this._errorInfoPtr;
+    // Use a fixed region at the END of guest memory for the error struct.
+    // This avoids needing guest-side malloc. Reserve 16+256 bytes.
+    const guestSize = this.k.kernel_guest_memory_size();
+    const errorStructGuestAddr = guestSize - 512; // near end of guest memory
+    const msgGuestAddr = errorStructGuestAddr + 16;
+    const base = this._guestBase();
     const status = this._lastStatus ?? 0;
-    // Error messages per status
     const messages = [
       null, 'Invalid argument', 'An object was expected', 'A string was expected',
       'A name was expected', 'A function was expected', 'A number was expected',
@@ -706,20 +707,18 @@ export class NapiRuntime {
       'An exception is pending', 'Cancelled', 'napi_escape_called_twice',
     ];
     const msg = messages[status] ?? null;
-    let msgPtr = 0;
+    let errorMsgGuestPtr = 0;
     if (msg) {
-      if (!this._errorMsgBuf) this._errorMsgBuf = this.k.kernel_alloc(256);
-      const base = this._guestBase();
       const mem = new Uint8Array(this._buf());
-      for (let i = 0; i < msg.length; i++) mem[base + this._errorMsgBuf + i] = msg.charCodeAt(i);
-      mem[base + this._errorMsgBuf + msg.length] = 0;
-      msgPtr = this._errorMsgBuf;
+      for (let i = 0; i < msg.length; i++) mem[base + msgGuestAddr + i] = msg.charCodeAt(i);
+      mem[base + msgGuestAddr + msg.length] = 0;
+      errorMsgGuestPtr = msgGuestAddr;
     }
-    this._writeU32(p, msgPtr);      // error_message
-    this._writeU32(p + 4, 0);       // engine_reserved
-    this._writeU32(p + 8, 0);       // engine_error_code
-    this._writeU32(p + 12, status); // error_code (napi_status)
-    this._writeU32(resultPtr, p);   // write pointer to struct
+    this._writeU32(errorStructGuestAddr, errorMsgGuestPtr);
+    this._writeU32(errorStructGuestAddr + 4, 0);
+    this._writeU32(errorStructGuestAddr + 8, 0);
+    this._writeU32(errorStructGuestAddr + 12, status);
+    this._writeU32(resultPtr, errorStructGuestAddr);
     return napi_ok;
   }
 
@@ -1271,13 +1270,19 @@ export class NapiRuntime {
 
   // napi_get_value_external returns data ptr from external objects
   napi_check_object_type_tag(args) {
-    // Type tagging not fully implemented — return false
     const [env, objectHandle, typeTagPtr, resultPtr] = args;
-    this._writeU32(resultPtr, 0);
+    // Check if object has the given type tag
+    const obj = this._getHandle(objectHandle);
+    const matches = obj && obj._typeTag && typeTagPtr
+      ? obj._typeTag === typeTagPtr  // simplified: compare tag pointers
+      : false;
+    this._writeBool(resultPtr, matches);
     return napi_ok;
   }
   napi_type_tag_object(args) {
-    // No-op for now
+    const [env, objectHandle, typeTagPtr] = args;
+    const obj = this._getHandle(objectHandle);
+    if (obj && typeof obj === 'object') obj._typeTag = typeTagPtr;
     return napi_ok;
   }
 
