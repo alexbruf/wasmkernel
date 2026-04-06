@@ -770,6 +770,18 @@ kernel_load(uint32_t wasm_ptr, uint32_t wasm_len)
     }
 
     /* 256KB stack, 64MB heap — large guests like oxide need ~62MB shared memory */
+    /* Fix: WAMR's page-merge optimization can reduce max_page_count below the
+       module's declared value. Restore it for non-shared memory modules that
+       can grow (possible_memory_grow). Skip shared memory — WAMR pre-allocates
+       the full max for shared, which would be too large. */
+    {
+        WASMModule *m = (WASMModule *)g_guest_module;
+        if (m->memory_count > 0 && m->possible_memory_grow
+            && !(m->memories[0].flags & 0x02) /* not shared */
+            && m->memories[0].max_page_count <= m->memories[0].init_page_count) {
+            m->memories[0].max_page_count = 32768; /* 2GB safe for wasm32 */
+        }
+    }
     g_guest_instance = wasm_runtime_instantiate(g_guest_module,
                                                  256 * 1024, 64 * 1024 * 1024,
                                                  g_error_buf, sizeof(g_error_buf));
