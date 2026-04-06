@@ -245,7 +245,7 @@ export class NapiRuntime {
 
   napi_set_named_property(args) {
     const [env, objectHandle, namePtr, valueHandle] = args;
-    if (!objectHandle || !namePtr) return napi_invalid_arg;
+    if (!objectHandle || !namePtr || !valueHandle) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     const val = this._getHandle(valueHandle);
     const name = this._readNullTermString(namePtr);
@@ -255,7 +255,7 @@ export class NapiRuntime {
 
   napi_get_named_property(args) {
     const [env, objectHandle, namePtr, resultPtr] = args;
-    if (!objectHandle || !namePtr) return napi_invalid_arg;
+    if (!objectHandle || !namePtr || !resultPtr) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     const name = this._readNullTermString(namePtr);
     const val = obj?.[name];
@@ -415,6 +415,7 @@ export class NapiRuntime {
 
   napi_set_element(args) {
     const [env, objectHandle, index, valueHandle] = args;
+    if (!objectHandle) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     const val = this._getHandle(valueHandle);
     if (obj) obj[index] = val;
@@ -838,6 +839,7 @@ export class NapiRuntime {
   // napi_has_named_property(env, object, name_ptr, result_ptr)
   napi_has_named_property(args) {
     const [env, objectHandle, namePtr, resultPtr] = args;
+    if (!objectHandle || !namePtr || !resultPtr) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     const name = this._readNullTermString(namePtr);
     const has = obj && typeof obj === 'object' && name in obj;
@@ -848,7 +850,7 @@ export class NapiRuntime {
   // napi_has_property(env, object, key, result_ptr)
   napi_has_property(args) {
     const [env, objectHandle, keyHandle, resultPtr] = args;
-    if (!objectHandle || !keyHandle) return napi_invalid_arg;
+    if (!objectHandle || !keyHandle || !resultPtr) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     const key = this._getHandle(keyHandle);
     const has = obj && typeof obj === 'object' && key in obj;
@@ -1456,6 +1458,7 @@ export class NapiRuntime {
   // napi_define_properties(env, object, property_count, properties)
   napi_define_properties(args) {
     const [env, objectHandle, propCount, propsPtr] = args;
+    if (!objectHandle || (propCount > 0 && !propsPtr)) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     if (!obj || typeof obj !== 'object' && typeof obj !== 'function') return napi_object_expected;
     this._applyPropertyDescriptors(obj, propCount, propsPtr);
@@ -1588,6 +1591,7 @@ export class NapiRuntime {
   // napi_has_element(env, object, index, result)
   napi_has_element(args) {
     const [env, objectHandle, index, resultPtr] = args;
+    if (!objectHandle || !resultPtr) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     this._writeBool(resultPtr, obj && index in obj);
     return napi_ok;
@@ -1596,6 +1600,7 @@ export class NapiRuntime {
   // napi_delete_element(env, object, index, result) — result is bool* (1 byte)
   napi_delete_element(args) {
     const [env, objectHandle, index, resultPtr] = args;
+    if (!objectHandle) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     let ok = false;
     if (obj) {
@@ -1609,6 +1614,7 @@ export class NapiRuntime {
   // napi_delete_property(env, object, key, result)
   napi_delete_property(args) {
     const [env, objectHandle, keyHandle, resultPtr] = args;
+    if (!objectHandle || !keyHandle) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     const key = this._getHandle(keyHandle);
     let ok = false;
@@ -1623,6 +1629,7 @@ export class NapiRuntime {
   // napi_has_own_property(env, object, key, result)
   napi_has_own_property(args) {
     const [env, objectHandle, keyHandle, resultPtr] = args;
+    if (!objectHandle || !resultPtr) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     const key = this._getHandle(keyHandle);
     if (typeof key !== 'string' && typeof key !== 'symbol') return napi_name_expected;
@@ -1665,6 +1672,7 @@ export class NapiRuntime {
   // napi_get_prototype(env, object, result)
   napi_get_prototype(args) {
     const [env, objectHandle, resultPtr] = args;
+    if (!objectHandle || !resultPtr) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     const proto = Object.getPrototypeOf(obj);
     const h = this._newHandle(proto);
@@ -1676,6 +1684,7 @@ export class NapiRuntime {
   napi_get_property_names(args) {
     // Equivalent to get_all_property_names with include_prototypes, enumerable, skip_symbols, numbers_to_strings
     const [env, objectHandle, resultPtr] = args;
+    if (!objectHandle || !resultPtr) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     if (!obj) { this._writeResult(resultPtr, this._newHandle([])); return napi_ok; }
     const names = [];
@@ -1689,8 +1698,8 @@ export class NapiRuntime {
   // napi_get_all_property_names(env, object, key_mode, key_filter, key_conversion, result)
   napi_get_all_property_names(args) {
     const [env, objectHandle, keyMode, keyFilter, keyConversion, resultPtr] = args;
+    if (!objectHandle || !resultPtr) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
-    if (!resultPtr) return napi_invalid_arg;
     if (!obj) { this._writeResult(resultPtr, this._newHandle([])); return napi_ok; }
     // key_mode: 0=include_prototypes, 1=own_only
     // key_filter: 1=writable, 2=enumerable, 4=configurable, 8=skip_strings, 16=skip_symbols
