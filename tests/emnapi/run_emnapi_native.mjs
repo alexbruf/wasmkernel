@@ -39,11 +39,26 @@ process.env.NODE_OPTIONS = (process.env.NODE_OPTIONS || '') +
 
 // Find emnapi test file
 const emnapiTestDir = '/tmp/emnapi-repo/packages/test';
-const testFiles = [
-  `${testName}/${testName}.test.js`,
-  `${testName}/test.js`,
-  `${testName}/index.js`,
-];
+
+// Map wasm names that differ from their test directory/file
+const testFileMap = {
+  'objnestedwrap': 'objwrap/nestedwrap.test.js',
+  'objwrapbasicfinalizer': 'objwrap/objwrapbasicfinalizer.test.js',
+  'runjs_cnrj': 'runjs/runjs.test.js',
+  'runjs_pe': 'runjs/runjs.test.js',
+  'string_mt': 'string/string-pthread.test.js',
+  'object_exception': 'object/object_exceptions.test.js',
+  'reference_all_types': 'ref_by_node_api_version/ref_by_node_api_version.test.js',
+  'reference_obj_only': 'ref_by_node_api_version/ref_by_node_api_version.test.js',
+};
+
+const testFiles = Object.hasOwn(testFileMap, testName)
+  ? [testFileMap[testName]]
+  : [
+    `${testName}/${testName}.test.js`,
+    `${testName}/test.js`,
+    `${testName}/index.js`,
+  ];
 
 let testFile;
 for (const f of testFiles) {
