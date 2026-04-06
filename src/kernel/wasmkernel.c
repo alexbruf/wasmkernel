@@ -603,10 +603,16 @@ wasi_poll_oneoff(wasm_exec_env_t exec_env, uint64 *args)
 static void
 wasi_sched_yield(wasm_exec_env_t exec_env, uint64 *args)
 {
+    extern void *wasmkernel_get_asyncify_buf(wasm_exec_env_t);
+    extern void asyncify_start_unwind(void *);
+
     native_raw_return_type(uint32, args);
     /* Set yield flag so the thread gives up its time slice */
     WASM_SUSPEND_FLAGS_FETCH_OR(exec_env->suspend_flags,
                                 WASM_SUSPEND_FLAG_YIELD);
+    /* For spawned threads, trigger asyncify unwind to actually yield */
+    void *abuf = wasmkernel_get_asyncify_buf(exec_env);
+    if (abuf) asyncify_start_unwind(abuf);
     native_raw_set_return(0);
 }
 

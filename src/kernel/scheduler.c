@@ -90,10 +90,28 @@ wasmkernel_scheduler_register_thread(wasm_exec_env_t exec_env,
     return tid;
 }
 
+/* Track addresses where notify fired but no thread was waiting */
+#define MAX_PENDING_NOTIFIES 64
+static void *g_pending_notify_addrs[MAX_PENDING_NOTIFIES];
+static uint32_t g_pending_notify_count = 0;
+
 void
 wasmkernel_scheduler_block_on_wait(wasm_exec_env_t exec_env,
                                    void *addr, int64_t timeout_us)
 {
+    /* Check for pending notify on this address — if found, don't block */
+    for (uint32_t i = 0; i < g_pending_notify_count; i++) {
+        if (g_pending_notify_addrs[i] == addr) {
+            /* Consume the pending notify */
+            g_pending_notify_addrs[i] =
+                g_pending_notify_addrs[--g_pending_notify_count];
+            /* Still yield to give other threads a chance */
+            WASM_SUSPEND_FLAGS_FETCH_OR(exec_env->suspend_flags,
+                                        WASM_SUSPEND_FLAG_YIELD);
+            return;
+        }
+    }
+
     /* Find the thread for this exec_env */
     for (uint32_t i = 0; i < g_scheduler.num_threads; i++) {
         WasmKernelThread *t = &g_scheduler.threads[i];
@@ -123,6 +141,11 @@ wasmkernel_scheduler_wake_waiters(void *addr, uint32_t count)
             t->wait_address = NULL;
             woken++;
         }
+    }
+
+    /* If nobody was waiting, record as pending notify */
+    if (woken == 0 && g_pending_notify_count < MAX_PENDING_NOTIFIES) {
+        g_pending_notify_addrs[g_pending_notify_count++] = addr;
     }
 
     return woken;
