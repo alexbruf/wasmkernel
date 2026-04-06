@@ -94,18 +94,23 @@ export class NapiRuntime {
     this.globalHandle = this._newHandle(globalThis);
   }
 
-  // Register a destructor callback for a JS object
+  // Register a destructor callback for a JS object.
+  // Returns an unregister token that can cancel the finalizer.
   _registerFinalizer(jsObj, finalizeCb, dataPtr, hintPtr, envPtr) {
     if (this._postedFinalizersRegistry && finalizeCb) {
       // Track object→refs mapping so we can clear weak refs when finalizer fires
       if (!this._objToRefIds) this._objToRefIds = new WeakMap();
       const refIds = this._objToRefIds.get(jsObj) || [];
       this._objToRefIds.set(jsObj, refIds);
+      const token = { cancelled: false }; // unique object for unregistration
       this._postedFinalizersRegistry.register(jsObj, {
         cb: finalizeCb, env: envPtr || this._guestEnv || 1, data: dataPtr, hint: hintPtr,
         refIds, // shared array — refs added later will appear here
-      });
+        token,
+      }, token);
+      return token;
     }
+    return null;
   }
 
   // Drain queued destructor callbacks (called from dispatch or async)
@@ -113,7 +118,8 @@ export class NapiRuntime {
     if (this._drainingFinalizers) return; // prevent re-entrancy
     this._drainingFinalizers = true;
     while (this._postedFinalizers.length > 0) {
-      const { cb, env: envPtr, data, hint, refIds } = this._postedFinalizers.shift();
+      const { cb, env: envPtr, data, hint, refIds, token } = this._postedFinalizers.shift();
+      if (token?.cancelled) continue; // cancelled by napi_delete_reference
       try {
         // Clear weak refs for this object so napi_get_reference_value returns NULL
         if (refIds) {
@@ -591,6 +597,15 @@ export class NapiRuntime {
       this._referencedHandles.delete(ref.handle);
       this.handles.delete(ref.handle); // allow GC
     }
+    // Cancel any associated finalizer
+    const token = this._refTokens?.get(refId);
+    if (token) {
+      token.cancelled = true;
+      if (this._postedFinalizersRegistry) {
+        this._postedFinalizersRegistry.unregister(token);
+      }
+      this._refTokens.delete(refId);
+    }
     this.refs.delete(refId);
     this._refPtrToId?.delete(refPtr);
     return napi_ok;
@@ -723,7 +738,17 @@ export class NapiRuntime {
     if (obj != null && (typeof obj === 'object' || typeof obj === 'function')) {
       if (this.wraps.has(obj)) return napi_invalid_arg; // already wrapped
       this.wraps.set(obj, nativePtr);
-      this._registerFinalizer(obj, finalizeCb, nativePtr, finalizeHint);
+      const token = this._registerFinalizer(obj, finalizeCb, nativePtr, finalizeHint);
+      if (resultPtr && token) {
+        // Store token so napi_delete_reference can cancel the finalizer
+        if (!this._refTokens) this._refTokens = new Map();
+        const refId = this.nextRef++;
+        const refPtr = this._allocRefPtr(refId);
+        this.refs.set(refId, { handle: objectHandle, refcount: 0, ptr: refPtr });
+        this._refTokens.set(refId, token);
+        this._writeU32(resultPtr, refPtr);
+        return napi_ok;
+      }
     }
     if (resultPtr) {
       const refId = this.nextRef++;
@@ -1945,7 +1970,10 @@ export class NapiRuntime {
     let ok = false;
     if (obj) {
       try { ok = delete obj[index]; }
-      catch { ok = false; }
+      catch (e) {
+        if (e instanceof TypeError) { ok = false; }
+        else throw e;
+      }
     }
     if (resultPtr) this._writeBool(resultPtr, ok);
     return napi_ok;
@@ -1960,7 +1988,10 @@ export class NapiRuntime {
     let ok = false;
     if (obj) {
       try { ok = delete obj[key]; }
-      catch { ok = false; } // strict mode throws for non-configurable
+      catch (e) {
+        if (e instanceof TypeError) { ok = false; }
+        else throw e; // Proxy trap errors propagate to dispatch
+      }
     }
     if (resultPtr) this._writeBool(resultPtr, ok);
     return napi_ok;
@@ -2280,13 +2311,18 @@ export class NapiRuntime {
   napi_add_finalizer(args) {
     const [env, objectHandle, dataPtr, finalizeCb, finalizeHint, resultPtr] = args;
     const obj = this._getHandle(objectHandle);
+    let token = null;
     if (obj != null && (typeof obj === 'object' || typeof obj === 'function')) {
-      this._registerFinalizer(obj, finalizeCb, dataPtr, finalizeHint);
+      token = this._registerFinalizer(obj, finalizeCb, dataPtr, finalizeHint);
     }
     if (resultPtr) {
       const refId = this.nextRef++;
       const refPtr = this._allocRefPtr(refId);
       this.refs.set(refId, { handle: objectHandle, refcount: 0, ptr: refPtr });
+      if (token) {
+        if (!this._refTokens) this._refTokens = new Map();
+        this._refTokens.set(refId, token);
+      }
       this._writeU32(resultPtr, refPtr);
     }
     return napi_ok;
@@ -2781,7 +2817,15 @@ export class NapiRuntime {
     }
     const method = this[funcName];
     if (method) {
-      const result = method.call(this, args);
+      let result;
+      try {
+        result = method.call(this, args);
+      } catch (e) {
+        // JS exception from the operation (e.g. Proxy trap throw)
+        this.lastException = e;
+        this.exceptionPending = true;
+        result = napi_pending_exception;
+      }
       this._lastStatus = result; // track for napi_get_last_error_info
       if (this.debug) {
         console.error(`  napi: ${funcName}(${args.join(',')}) -> ${result}`);
