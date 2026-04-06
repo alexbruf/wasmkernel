@@ -60,6 +60,7 @@ include(${WAMR_ROOT_DIR}/build-scripts/runtime_lib.cmake)
 add_executable(wasmkernel
     src/kernel/wasmkernel.c
     src/kernel/scheduler.c
+    src/kernel/asyncify_stubs.c
     ${WAMR_RUNTIME_LIB_SOURCE}
 )
 
@@ -87,3 +88,12 @@ set_target_properties(wasmkernel PROPERTIES
     OUTPUT_NAME "wasmkernel"
     SUFFIX ".wasm"
 )
+
+# Apply asyncify transform for cooperative thread yield/resume
+find_program(WASM_OPT wasm-opt)
+if(WASM_OPT)
+    add_custom_command(TARGET wasmkernel POST_BUILD
+        COMMAND ${WASM_OPT} --asyncify $<TARGET_FILE:wasmkernel> -o $<TARGET_FILE:wasmkernel>
+        COMMENT "Applying asyncify transform"
+    )
+endif()

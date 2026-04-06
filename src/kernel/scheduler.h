@@ -50,6 +50,9 @@ typedef struct WasmKernelThread {
     void *(*start_routine)(void *);
     void *start_arg;
 
+    /* Asyncify data buffer for yield/resume (cooperative scheduling) */
+    uint8_t asyncify_buf[4096];
+
     /* For async I/O (THREAD_BLOCKED_IO) */
     uint32_t io_callback_id;
     uint32_t io_op_type;       /* IO_OP_* */

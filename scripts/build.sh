@@ -8,6 +8,10 @@ echo "=== Building wasmkernel.wasm ==="
 cmake -B build -DCMAKE_TOOLCHAIN_FILE=cmake/wasi-sdk.cmake -DCMAKE_BUILD_TYPE=Release 2>&1 | tail -3
 cmake --build build 2>&1 | tail -3
 
+echo "=== Applying asyncify transform ==="
+wasm-opt --asyncify build/wasmkernel.wasm -o build/wasmkernel.wasm
+echo "  asyncify done ($(wc -c < build/wasmkernel.wasm) bytes)"
+
 WASI_SDK="${WASI_SDK_PATH:-/tmp/wasi-sdk-25.0-arm64-macos}"
 CC="$WASI_SDK/bin/clang"
 
