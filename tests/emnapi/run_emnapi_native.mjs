@@ -13,7 +13,17 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const testName = process.argv[2];
 if (!testName) { console.error("Usage: run_emnapi_native.mjs <test_name>"); process.exit(1); }
 
-// Note: string test's TestUtf8Large (256MB) needs --max-old-space-size=4096
+// Ensure large heap for tests that allocate 256MB+ (e.g. string TestUtf8Large).
+// Re-exec with --max-old-space-size if not already set.
+if (!process.execArgv.some(a => a.includes('max-old-space-size'))) {
+  const { execFileSync } = await import('child_process');
+  try {
+    execFileSync(process.execPath, [
+      '--max-old-space-size=4096', ...process.execArgv, ...process.argv.slice(1)
+    ], { stdio: 'inherit', env: process.env, timeout: 120000 });
+  } catch (e) { process.exit(e.status ?? 1); }
+  process.exit(0);
+}
 
 // Suppress emnapi's global leak checker
 process.env.NODE_TEST_KNOWN_GLOBALS = '0';
