@@ -35,6 +35,12 @@ const napi_function = 7;
 const napi_external = 8;
 const napi_bigint = 9;
 
+// Import async_hooks for proper async context support (Node.js only)
+let AsyncResource = null;
+try {
+  AsyncResource = (await import('node:async_hooks')).AsyncResource;
+} catch {}
+
 export class NapiRuntime {
   constructor(kernelExports) {
     this.k = kernelExports;
@@ -397,10 +403,8 @@ export class NapiRuntime {
       // Get return value BEFORE popping scope (it's in current scope)
       const retVal = self._getHandle(resultHandle);
       self._popScope();
-      // Drain any deferred async work
-      if (self._pendingAsyncQueue && self._pendingAsyncQueue.length > 0) {
-        self.drainAsyncQueue();
-      }
+      // Drain deferred async work — scheduled via stepper or manual drain
+      // Don't auto-drain here to avoid re-entrancy with kernel_call_indirect
       return retVal;
     };
   }
@@ -1368,10 +1372,15 @@ export class NapiRuntime {
   napi_create_external_arraybuffer(args) {
     const [env, dataPtr, byteLength, finalizeCb, finalizeHint, resultPtr] = args;
     const ab = new ArrayBuffer(byteLength);
-    // Map to existing guest memory at dataPtr
-    this._abMemory.set(ab, { address: dataPtr, ownership: 0, runtimeAllocated: 0 });
-    // Sync guest → JS (the guest already has data there)
-    this._syncGuestToJS(ab);
+    if (dataPtr === 0 && byteLength === 0) {
+      // NULL data + 0 length = create a detached/neutered ArrayBuffer
+      try { new MessageChannel().port1.postMessage(null, [ab]); } catch {}
+      ab._detached = true;
+    } else {
+      // Map to existing guest memory at dataPtr
+      this._abMemory.set(ab, { address: dataPtr, ownership: 0, runtimeAllocated: 0 });
+      this._syncGuestToJS(ab);
+    }
     this._registerFinalizer(ab, finalizeCb, dataPtr, finalizeHint);
     const h = this._newHandle(ab);
     this._writeResult(resultPtr, h);
@@ -2296,7 +2305,7 @@ export class NapiRuntime {
     const [env, workId] = args;
     const work = this._asyncWorks.get(workId);
     if (!work) return napi_generic_failure;
-    work.status = 10; // napi_cancelled
+    work.status = napi_cancelled;
     // Remove from pending queue if not yet started
     this._pendingAsyncQueue = this._pendingAsyncQueue.filter(
       item => item.work !== work || item.type !== 'execute'
@@ -2314,23 +2323,27 @@ export class NapiRuntime {
 
       if (item.type === 'execute') {
         if (work.executeCb) {
-          try {
-            const ap = this.k.kernel_alloc(16);
-            new DataView(this._buf()).setUint32(ap, 1, true);
-            new DataView(this._buf()).setUint32(ap + 4, work.dataPtr, true);
-            this.k.kernel_call_indirect(work.executeCb, 2, ap);
-          } catch (e) { /* Execute may trap (e.g. sleep) — that's OK */ }
+          const ap = this.k.kernel_alloc(16);
+          new DataView(this._buf()).setUint32(ap, this._guestEnv || 1, true);
+          new DataView(this._buf()).setUint32(ap + 4, work.dataPtr, true);
+          const r = this.k.kernel_call_indirect_simple(work.executeCb, 2, ap);
+          if (r !== 0) { work.status = 1; }
         }
         this._pendingAsyncQueue.push({ type: 'complete', work });
       } else if (item.type === 'complete') {
         if (work.completeCb) {
-          try {
-            const ap = this.k.kernel_alloc(16);
-            new DataView(this._buf()).setUint32(ap, 1, true);
-            new DataView(this._buf()).setUint32(ap + 4, work.status, true);
-            new DataView(this._buf()).setUint32(ap + 8, work.dataPtr, true);
-            this.k.kernel_call_indirect(work.completeCb, 3, ap);
-          } catch (e) { /* Complete failed */ }
+          const ap = this.k.kernel_alloc(16);
+          new DataView(this._buf()).setUint32(ap, this._guestEnv || 1, true);
+          new DataView(this._buf()).setUint32(ap + 4, work.status, true);
+          new DataView(this._buf()).setUint32(ap + 8, work.dataPtr, true);
+          this.k.kernel_call_indirect_simple(work.completeCb, 3, ap);
+          // Propagate any exception from the complete callback
+          if (this.exceptionPending) {
+            const exc = this.lastException;
+            this.lastException = null;
+            this.exceptionPending = false;
+            if (exc) process.nextTick(() => { throw exc; });
+          }
         }
       }
     }
@@ -2343,19 +2356,61 @@ export class NapiRuntime {
     return napi_ok;
   }
 
-  // napi_async_init/destroy — just track context IDs
+  // napi_async_init/destroy — integrated with Node.js async_hooks
   _nextAsyncContextId = 1;
+  _asyncContexts = new Map(); // contextId -> AsyncResource
+
   napi_async_init(args) {
     const [env, asyncResource, asyncResourceName, resultPtr] = args;
-    this._writeU32(resultPtr, this._nextAsyncContextId++);
+    const id = this._nextAsyncContextId++;
+    const name = (asyncResourceName ? this._getHandle(asyncResourceName) : null) || 'napi_async';
+    if (AsyncResource) {
+      try {
+        const ar = new AsyncResource(name, { requireManualDestroy: true });
+        this._asyncContexts.set(id, { ar });
+      } catch {}
+    }
+    this._writeU32(resultPtr, id);
     return napi_ok;
   }
-  napi_async_destroy(args) { return napi_ok; }
+
+  napi_async_destroy(args) {
+    const [env, contextId] = args;
+    const ctx = this._asyncContexts.get(contextId);
+    if (ctx?.ar) {
+      try { ctx.ar.emitDestroy(); } catch {}
+    }
+    this._asyncContexts.delete(contextId);
+    return napi_ok;
+  }
 
   // napi_make_callback(env, async_context, recv, func, argc, argv, result)
   napi_make_callback(args) {
-    // Skip async_context, delegate to napi_call_function
-    const [env, _asyncCtx, recvHandle, funcHandle, argc, argvPtr, resultPtr] = args;
+    const [env, asyncCtx, recvHandle, funcHandle, argc, argvPtr, resultPtr] = args;
+    const ctx = this._asyncContexts.get(asyncCtx);
+    if (ctx?.ar) {
+      // Run the callback inside the async resource's scope
+      const fn = this._getHandle(funcHandle);
+      const recv = this._getHandle(recvHandle);
+      const fnArgs = [];
+      for (let i = 0; i < argc; i++) {
+        const argHandle = this._readU32(argvPtr + i * 4);
+        fnArgs.push(this._getHandle(argHandle));
+      }
+      try {
+        const result = ctx.ar.runInAsyncScope(fn, recv, ...fnArgs);
+        if (resultPtr) {
+          const h = this._newHandle(result);
+          this._writeResult(resultPtr, h);
+        }
+      } catch (e) {
+        this.lastException = e;
+        this.exceptionPending = true;
+        return napi_pending_exception;
+      }
+      return napi_ok;
+    }
+    // Fallback: delegate to napi_call_function
     return this.napi_call_function([env, recvHandle, funcHandle, argc, argvPtr, resultPtr]);
   }
 

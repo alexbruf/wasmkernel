@@ -338,8 +338,11 @@ wasmkernel_scheduler_step(void)
     thread->state = THREAD_RUNNING;
 
     /* Set fuel for this time slice */
-    if (thread->exec_env)
+    if (thread->exec_env) {
         thread->exec_env->instructions_to_execute = g_scheduler.fuel_per_slice;
+        /* Enable spin yield only for spawned threads (not main thread) */
+        thread->exec_env->_spin_yield_enabled = (thread->start_routine != NULL);
+    }
 
     /* Clear yield flag before running */
     WASM_SUSPEND_FLAGS_FETCH_AND(thread->exec_env->suspend_flags,
@@ -501,6 +504,27 @@ wasmkernel_scheduler_block_on_poll_clock(wasm_exec_env_t exec_env,
                                           uint32_t nevents_ptr,
                                           uint64_t userdata)
 {
+    /* When called from kernel_call_indirect_simple (non-cooperative context),
+     * don't block — just write the event result and return immediately.
+     * This makes sleep() a no-op in async Execute callbacks, matching the
+     * behavior of a background thread that ran instantly. */
+    extern bool g_main_thread_asyncify_enabled;
+    if (!g_main_thread_asyncify_enabled && g_scheduler.threads[0].exec_env == exec_env) {
+        /* Write a successful clock event so the guest sees poll_oneoff succeed */
+        wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
+        uint8_t *evt = (uint8_t *)wasm_runtime_addr_app_to_native(
+            inst, (uint64_t)event_out_ptr);
+        uint32_t *nev = (uint32_t *)wasm_runtime_addr_app_to_native(
+            inst, (uint64_t)nevents_ptr);
+        if (evt) {
+            memset(evt, 0, 32);
+            memcpy(evt, &userdata, 8);
+            /* type = clock (0) at offset 10, error = 0 */
+        }
+        if (nev) *nev = 1;
+        return;
+    }
+
     for (uint32_t i = 0; i < g_scheduler.num_threads; i++) {
         WasmKernelThread *t = &g_scheduler.threads[i];
         if (t->exec_env == exec_env) {
@@ -515,6 +539,16 @@ wasmkernel_scheduler_block_on_poll_clock(wasm_exec_env_t exec_env,
                                         WASM_SUSPEND_FLAG_YIELD);
             return;
         }
+    }
+}
+
+void
+wasmkernel_scheduler_reset_main_thread(void)
+{
+    WasmKernelThread *t = &g_scheduler.threads[0];
+    if (t->state == THREAD_BLOCKED_IO || t->state == THREAD_BLOCKED_WAIT) {
+        t->state = THREAD_READY;
+        t->io_op_type = IO_OP_NONE;
     }
 }
 

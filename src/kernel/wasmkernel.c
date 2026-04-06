@@ -876,6 +876,52 @@ kernel_call(uint32_t func_name_ptr, uint32_t argv_ptr, uint32_t argc)
  * (table indices) that the host needs to call back into.
  * argv_ptr points to uint32 args in kernel memory.
  * Return value written to argv[0]. Returns 0 on success. */
+/* Simple call_indirect without asyncify or cooperative scheduling.
+ * Temporarily DISABLES asyncify for the main thread so the interpreter
+ * runs the guest function without asyncify state interference. */
+__attribute__((export_name("kernel_call_indirect_simple")))
+int32_t
+kernel_call_indirect_simple(uint32_t table_idx, uint32_t argc, uint32_t argv_ptr)
+{
+    if (!g_guest_instance || !g_guest_exec_env)
+        return -1;
+    uint32_t *argv = argv_ptr ? (uint32_t *)(uintptr_t)argv_ptr : NULL;
+
+    /* Disable asyncify for this call */
+    extern bool g_main_thread_asyncify_enabled;
+    bool was_enabled = g_main_thread_asyncify_enabled;
+    g_main_thread_asyncify_enabled = false;
+
+    /* Clear any stale YIELD flag so we don't accidentally resume a
+     * previous yielded frame instead of starting the new call.
+     * This can happen when the Execute callback calls sleep() which
+     * triggers poll_oneoff → block_on_poll_clock → YIELD. */
+    WASM_SUSPEND_FLAGS_FETCH_AND(g_guest_exec_env->suspend_flags,
+                                  ~WASM_SUSPEND_FLAG_YIELD);
+    /* Also reset the main thread's scheduler state — if a previous call
+     * set it to BLOCKED_IO, we need to clear that. */
+    wasmkernel_scheduler_reset_main_thread();
+
+    g_guest_exec_env->instructions_to_execute = 100000000;
+    if (!wasm_runtime_call_indirect(g_guest_exec_env, table_idx, argc, argv)) {
+        const char *exc = wasm_runtime_get_exception(g_guest_instance);
+        if (exc) wasm_runtime_clear_exception(g_guest_instance);
+        /* Clear yield flag in case the call yielded (e.g. sleep/poll_oneoff) */
+        WASM_SUSPEND_FLAGS_FETCH_AND(g_guest_exec_env->suspend_flags,
+                                      ~WASM_SUSPEND_FLAG_YIELD);
+        wasmkernel_scheduler_reset_main_thread();
+        g_main_thread_asyncify_enabled = was_enabled;
+        return -3;
+    }
+    /* Clear yield flag after successful return too — the call may have
+     * set it via poll_oneoff but then completed within the fuel budget. */
+    WASM_SUSPEND_FLAGS_FETCH_AND(g_guest_exec_env->suspend_flags,
+                                  ~WASM_SUSPEND_FLAG_YIELD);
+    wasmkernel_scheduler_reset_main_thread();
+    g_main_thread_asyncify_enabled = was_enabled;
+    return 0;
+}
+
 __attribute__((export_name("kernel_call_indirect")))
 int32_t
 kernel_call_indirect(uint32_t table_idx, uint32_t argc, uint32_t argv_ptr)

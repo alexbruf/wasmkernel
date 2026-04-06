@@ -124,8 +124,16 @@ exports.load = async function (targetName, options = {}) {
   result._napiRuntime = napiRuntime
   const stepper = setInterval(() => {
     const threadCount = k.kernel_thread_count()
+
     if (threadCount <= 0) {
       napiRuntime.drainTsfnQueue()
+      napiRuntime.drainAsyncQueue()
+      // Unref when no more work to do
+      if (napiRuntime._pendingAsyncQueue.length === 0
+          && (!napiRuntime._tsfnQueue || napiRuntime._tsfnQueue.length === 0)
+          && stepper.unref) {
+        stepper.unref()
+      }
       return
     }
     // Run a batch of steps to give threads time
@@ -136,9 +144,26 @@ exports.load = async function (targetName, options = {}) {
     // Drain any queued threadsafe function calls and async sends
     napiRuntime.drainTsfnQueue()
     napiRuntime.drainAsyncSendQueue()
+    if (napiRuntime._pendingAsyncQueue.length > 0) {
+      napiRuntime.drainAsyncQueue()
+    }
+    // Unref when no more work
+    if (napiRuntime._pendingAsyncQueue.length === 0
+        && threadCount <= 0
+        && stepper.unref) {
+      stepper.unref()
+    }
   }, 1)
-  // Don't let the stepper keep the process alive
+  // Don't let the stepper keep the process alive when idle
   if (stepper.unref) stepper.unref()
+
+  // Hook into napi_queue_async_work to ref the stepper when work is pending
+  const origQueueAsyncWork = napiRuntime.napi_queue_async_work.bind(napiRuntime)
+  napiRuntime.napi_queue_async_work = function(args) {
+    const r = origQueueAsyncWork(args)
+    if (stepper.ref) stepper.ref()
+    return r
+  }
 
   return result
 }

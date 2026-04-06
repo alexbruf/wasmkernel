@@ -121,6 +121,12 @@ wasmkernel_scheduler_block_on_poll_clock(wasm_exec_env_t exec_env,
                                           uint32_t nevents_ptr,
                                           uint64_t userdata);
 
+/* Reset the main thread (index 0) back to READY state.
+   Used by kernel_call_indirect_simple to clean up after calls that
+   triggered cooperative scheduling (e.g. sleep → poll_oneoff → BLOCKED_IO). */
+void
+wasmkernel_scheduler_reset_main_thread(void);
+
 /* Check if a thread is in yield state (called from atomic wait/notify
    to determine if we should yield back to scheduler) */
 bool

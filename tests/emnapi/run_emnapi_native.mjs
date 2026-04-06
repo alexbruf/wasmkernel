@@ -28,10 +28,14 @@ if (!process.execArgv.some(a => a.includes('max-old-space-size'))) {
 // Suppress emnapi's global leak checker
 process.env.NODE_TEST_KNOWN_GLOBALS = '0';
 
+// Mark as WASI test so child processes add --experimental-wasi-unstable-preview1
+process.env.EMNAPI_TEST_WASI = '1';
+
 // Enable child process support: when tests spawn subprocesses (async, cleanup_hook),
 // the child needs our module resolution overrides. NODE_OPTIONS --require preloads them.
 process.env.NODE_OPTIONS = (process.env.NODE_OPTIONS || '') +
-  ` --require ${join(__dirname, 'child_wrapper.js')}`;
+  ` --require ${join(__dirname, 'child_wrapper.js')}`
+  + ' --experimental-wasi-unstable-preview1';
 
 // Find emnapi test file
 const emnapiTestDir = '/tmp/emnapi-repo/packages/test';
