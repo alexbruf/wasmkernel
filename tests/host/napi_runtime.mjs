@@ -63,12 +63,19 @@ export class NapiRuntime {
     if (typeof FinalizationRegistry !== 'undefined') {
       this._postedFinalizers = [];
       this._postedFinalizersPending = false;
+      this._drainScheduled = false;
       this._postedFinalizersRegistry = new FinalizationRegistry((info) => {
         // info = { cb, env, data, hint }
-        // Can't call kernel_call_indirect in finalizer callback (not in JS call stack from wasm)
-        // Queue it and drain when next bridge call happens
         this._postedFinalizers.push(info);
         this._postedFinalizersPending = true;
+        // Schedule async drain so GC tests work (gcUntil checks condition after setImmediate)
+        if (!this._drainScheduled) {
+          this._drainScheduled = true;
+          Promise.resolve().then(() => {
+            this._drainScheduled = false;
+            this._drainFinalizers();
+          });
+        }
       });
     }
 
@@ -81,23 +88,26 @@ export class NapiRuntime {
   }
 
   // Register a destructor callback for a JS object
-  _registerFinalizer(jsObj, finalizeCb, dataPtr, hintPtr) {
+  _registerFinalizer(jsObj, finalizeCb, dataPtr, hintPtr, envPtr) {
     if (this._postedFinalizersRegistry && finalizeCb) {
-      this._postedFinalizersRegistry.register(jsObj, { cb: finalizeCb, data: dataPtr, hint: hintPtr });
+      this._postedFinalizersRegistry.register(jsObj, { cb: finalizeCb, env: envPtr || this._guestEnv || 1, data: dataPtr, hint: hintPtr });
     }
   }
 
-  // Drain queued destructor callbacks (called from dispatch)
+  // Drain queued destructor callbacks (called from dispatch or async)
   _drainFinalizers() {
     while (this._postedFinalizers.length > 0) {
-      const { cb, data, hint } = this._postedFinalizers.shift();
+      const { cb, env: envPtr, data, hint } = this._postedFinalizers.shift();
       try {
-        const ap = this.k.kernel_alloc(16);
-        new DataView(this._buf()).setUint32(ap, 1, true);       // env
-        new DataView(this._buf()).setUint32(ap + 4, data, true); // finalize_data
-        new DataView(this._buf()).setUint32(ap + 8, hint, true); // finalize_hint
+        this._pushScope();
+        const ap = this.k.kernel_alloc(12);
+        const env2 = envPtr || this._guestEnv || 1;
+        new DataView(this._buf()).setUint32(ap, env2, true);        // env
+        new DataView(this._buf()).setUint32(ap + 4, data, true);   // finalize_data
+        new DataView(this._buf()).setUint32(ap + 8, hint, true);   // finalize_hint
         this.k.kernel_call_indirect(cb, 3, ap);
-      } catch {}
+        this._popScope();
+      } catch { this._popScope(); }
     }
     this._postedFinalizersPending = false;
   }
@@ -354,6 +364,7 @@ export class NapiRuntime {
 
   napi_create_function(args) {
     const [env, namePtr, nameLen, cbPtr, dataPtr, resultPtr] = args;
+    if (!cbPtr) return napi_invalid_arg;
     const fn = this._makeCallbackFunction(cbPtr, dataPtr);
     // Set function name if provided
     if (namePtr && nameLen > 0) {
@@ -439,15 +450,46 @@ export class NapiRuntime {
     // For weak refs (refcount=0), use WeakRef for objects so they can be GC'd
     const isObject = value !== null && (typeof value === 'object' || typeof value === 'function');
     const storedValue = (initialRefcount === 0 && isObject) ? new WeakRef(value) : value;
-    this.refs.set(refId, { handle: valueHandle, value: storedValue, weak: initialRefcount === 0 && isObject, refcount: initialRefcount });
+    const refPtr = this._allocRefPtr(refId);
+    this.refs.set(refId, { handle: valueHandle, value: storedValue, weak: initialRefcount === 0 && isObject, refcount: initialRefcount, ptr: refPtr });
     // Strong ref (refcount > 0): keep handle alive across scopes
     if (initialRefcount > 0) this._referencedHandles.add(valueHandle);
-    this._writeU32(resultPtr, refId);
+    this._writeU32(resultPtr, refPtr);
     return napi_ok;
   }
 
+  // Resolve a guest napi_ref pointer to our internal refId
+  _resolveRefId(refPtr) {
+    return this._refPtrToId?.get(refPtr) ?? refPtr;
+  }
+
+  // Bump allocator in guest memory for data the guest needs to access
+  _guestAlloc(size) {
+    if (!this._guestPoolBase) {
+      // Reserve 64KB pool in guest memory, below error struct area
+      const guestSize = this.k.kernel_guest_memory_size();
+      this._guestPoolBase = guestSize - 512 - 65536;
+      this._guestPoolOffset = 0;
+    }
+    // Align to 8 bytes
+    const aligned = (this._guestPoolOffset + 7) & ~7;
+    const guestAddr = this._guestPoolBase + aligned;
+    this._guestPoolOffset = aligned + size;
+    return guestAddr;
+  }
+
+  // Allocate a guest memory-backed ref and return the guest address
+  _allocRefPtr(refId) {
+    const guestAddr = this._guestAlloc(4);
+    new DataView(this._buf()).setUint32(this._guestBase() + guestAddr, refId, true);
+    this._refPtrToId = this._refPtrToId || new Map();
+    this._refPtrToId.set(guestAddr, refId);
+    return guestAddr;
+  }
+
   napi_get_reference_value(args) {
-    const [env, refId, resultPtr] = args;
+    const [env, refPtr, resultPtr] = args;
+    const refId = this._resolveRefId(refPtr);
     const ref = this.refs.get(refId);
     if (!ref) { this._writeResult(resultPtr, 0); return napi_ok; }
     // Resolve the value (deref WeakRef for weak references)
@@ -467,7 +509,8 @@ export class NapiRuntime {
   }
 
   napi_reference_unref(args) {
-    const [env, refId, resultPtr] = args;
+    const [env, refPtr, resultPtr] = args;
+    const refId = this._resolveRefId(refPtr);
     const ref = this.refs.get(refId);
     if (ref) ref.refcount = Math.max(0, ref.refcount - 1);
     if (resultPtr) this._writeU32(resultPtr, ref ? ref.refcount : 0);
@@ -475,13 +518,15 @@ export class NapiRuntime {
   }
 
   napi_delete_reference(args) {
-    const [env, refId] = args;
+    const [env, refPtr] = args;
+    const refId = this._resolveRefId(refPtr);
     const ref = this.refs.get(refId);
     if (ref) {
       this._referencedHandles.delete(ref.handle);
       this.handles.delete(ref.handle); // allow GC
     }
     this.refs.delete(refId);
+    this._refPtrToId?.delete(refPtr);
     return napi_ok;
   }
 
@@ -609,15 +654,16 @@ export class NapiRuntime {
   napi_wrap(args) {
     const [env, objectHandle, nativePtr, finalizeCb, finalizeHint, resultPtr] = args;
     const obj = this._getHandle(objectHandle);
-    if (obj && typeof obj === 'object') {
+    if (obj != null && (typeof obj === 'object' || typeof obj === 'function')) {
       if (this.wraps.has(obj)) return napi_invalid_arg; // already wrapped
       this.wraps.set(obj, nativePtr);
       this._registerFinalizer(obj, finalizeCb, nativePtr, finalizeHint);
     }
     if (resultPtr) {
       const refId = this.nextRef++;
-      this.refs.set(refId, { handle: objectHandle, refcount: 0 });
-      this._writeU32(resultPtr, refId);
+      const refPtr = this._allocRefPtr(refId);
+      this.refs.set(refId, { handle: objectHandle, refcount: 0, ptr: refPtr });
+      this._writeU32(resultPtr, refPtr);
     }
     return napi_ok;
   }
@@ -625,7 +671,7 @@ export class NapiRuntime {
   napi_unwrap(args) {
     const [env, objectHandle, resultPtr] = args;
     const obj = this._getHandle(objectHandle);
-    const ptr = (obj && typeof obj === 'object') ? (this.wraps.get(obj) ?? 0) : 0;
+    const ptr = (obj != null && (typeof obj === 'object' || typeof obj === 'function')) ? (this.wraps.get(obj) ?? 0) : 0;
     this._writeU32(resultPtr, ptr);
     return napi_ok;
   }
@@ -791,6 +837,10 @@ export class NapiRuntime {
       // setBigInt64 wraps naturally (mod 2^64) which matches V8 behavior
       try { i64val = BigInt(trunc); } catch { i64val = 0n; }
     }
+    const INT64_MAX = 9223372036854775807n;
+    const INT64_MIN = -9223372036854775808n;
+    if (i64val > INT64_MAX) i64val = INT64_MAX;
+    else if (i64val < INT64_MIN) i64val = INT64_MIN;
     new DataView(this._buf()).setBigInt64(base + resultPtr, i64val, true);
     return napi_ok;
   }
@@ -1055,6 +1105,17 @@ export class NapiRuntime {
     const [env, valueHandle, dataPtr, lengthPtr] = args;
     const val = this._getHandle(valueHandle);
     if (!Buffer.isBuffer(val) && !val?._isGuestBuffer) return napi_invalid_arg;
+    // Ensure JS-created buffers have a guest memory mapping
+    if (!this._abMemory.has(val) && val.byteLength > 0) {
+      const guestAddr = this._guestAlloc(val.byteLength);
+      this._abMemory.set(val, { address: guestAddr, ownership: 1, runtimeAllocated: 1 });
+    }
+    // Always sync JS content to guest memory
+    if (this._abMemory.has(val) && val.byteLength > 0) {
+      const base = this._guestBase();
+      const info = this._abMemory.get(val);
+      new Uint8Array(this._buf()).set(new Uint8Array(val.buffer, val.byteOffset, val.byteLength), base + info.address);
+    }
     const info = this._abMemory.get(val);
     if (dataPtr) this._writeU32(dataPtr, info?.address ?? 0);
     if (lengthPtr) this._writeU32(lengthPtr, val?.length ?? val?.byteLength ?? 0);
@@ -1211,7 +1272,20 @@ export class NapiRuntime {
     const [env, valueHandle, byteLengthPtr, dataPtr, abPtr, byteOffsetPtr] = args;
     const val = this._getHandle(valueHandle);
     if (byteLengthPtr) this._writeU32(byteLengthPtr, val?.byteLength ?? 0);
-    if (dataPtr) this._writeU32(dataPtr, 0); // data ptr not meaningful
+    if (dataPtr) {
+      const ab = val?.buffer;
+      if (ab instanceof ArrayBuffer && !this._abMemory.has(ab) && ab.byteLength > 0) {
+        const guestAddr = this._guestAlloc(ab.byteLength);
+        this._abMemory.set(ab, { address: guestAddr, ownership: 1, runtimeAllocated: 1 });
+      }
+      if (ab instanceof ArrayBuffer && this._abMemory.has(ab) && ab.byteLength > 0) {
+        const base = this._guestBase();
+        const info = this._abMemory.get(ab);
+        new Uint8Array(this._buf()).set(new Uint8Array(ab), base + info.address);
+      }
+      const info = this._abMemory.get(ab);
+      this._writeU32(dataPtr, info ? info.address + (val?.byteOffset ?? 0) : 0);
+    }
     if (abPtr) { const h = this._newHandle(val?.buffer); this._writeU32(abPtr, h); }
     if (byteOffsetPtr) this._writeU32(byteOffsetPtr, val?.byteOffset ?? 0);
     return napi_ok;
@@ -1758,8 +1832,9 @@ export class NapiRuntime {
     let resolve, reject;
     const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
     const deferredId = this.nextRef++;
-    this.refs.set(deferredId, { resolve, reject });
-    this._writeU32(deferredPtr, deferredId);
+    const deferredGuestPtr = this._allocRefPtr(deferredId);
+    this.refs.set(deferredId, { resolve, reject, ptr: deferredGuestPtr });
+    this._writeU32(deferredPtr, deferredGuestPtr);
     const h = this._newHandle(promise);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -1767,17 +1842,19 @@ export class NapiRuntime {
 
   // napi_resolve_deferred(env, deferred, value)
   napi_resolve_deferred(args) {
-    const [env, deferredId, valueHandle] = args;
+    const [env, deferredPtr, valueHandle] = args;
+    const deferredId = this._resolveRefId(deferredPtr);
     const d = this.refs.get(deferredId);
-    if (d?.resolve) { d.resolve(this._getHandle(valueHandle)); this.refs.delete(deferredId); }
+    if (d?.resolve) { d.resolve(this._getHandle(valueHandle)); this.refs.delete(deferredId); this._refPtrToId?.delete(deferredPtr); }
     return napi_ok;
   }
 
   // napi_reject_deferred(env, deferred, value)
   napi_reject_deferred(args) {
-    const [env, deferredId, valueHandle] = args;
+    const [env, deferredPtr, valueHandle] = args;
+    const deferredId = this._resolveRefId(deferredPtr);
     const d = this.refs.get(deferredId);
-    if (d?.reject) { d.reject(this._getHandle(valueHandle)); this.refs.delete(deferredId); }
+    if (d?.reject) { d.reject(this._getHandle(valueHandle)); this.refs.delete(deferredId); this._refPtrToId?.delete(deferredPtr); }
     return napi_ok;
   }
 
@@ -1807,7 +1884,8 @@ export class NapiRuntime {
 
   // napi_reference_ref(env, ref, result)
   napi_reference_ref(args) {
-    const [env, refId, resultPtr] = args;
+    const [env, refPtr, resultPtr] = args;
+    const refId = this._resolveRefId(refPtr);
     const ref = this.refs.get(refId);
     if (ref && ref.refcount !== undefined) ref.refcount++;
     if (resultPtr) this._writeU32(resultPtr, ref?.refcount ?? 0);
@@ -1818,8 +1896,9 @@ export class NapiRuntime {
   napi_remove_wrap(args) {
     const [env, objectHandle, resultPtr] = args;
     const obj = this._getHandle(objectHandle);
-    const ptr = (obj && typeof obj === 'object') ? (this.wraps.get(obj) ?? 0) : 0;
-    if (obj && typeof obj === 'object') this.wraps.delete(obj);
+    const isObj = obj != null && (typeof obj === 'object' || typeof obj === 'function');
+    const ptr = isObj ? (this.wraps.get(obj) ?? 0) : 0;
+    if (isObj) this.wraps.delete(obj);
     if (resultPtr) this._writeU32(resultPtr, ptr);
     return napi_ok;
   }
@@ -1924,13 +2003,14 @@ export class NapiRuntime {
   napi_add_finalizer(args) {
     const [env, objectHandle, dataPtr, finalizeCb, finalizeHint, resultPtr] = args;
     const obj = this._getHandle(objectHandle);
-    if (obj && typeof obj === 'object') {
+    if (obj != null && (typeof obj === 'object' || typeof obj === 'function')) {
       this._registerFinalizer(obj, finalizeCb, dataPtr, finalizeHint);
     }
     if (resultPtr) {
       const refId = this.nextRef++;
-      this.refs.set(refId, { handle: objectHandle, refcount: 0 });
-      this._writeU32(resultPtr, refId);
+      const refPtr = this._allocRefPtr(refId);
+      this.refs.set(refId, { handle: objectHandle, refcount: 0, ptr: refPtr });
+      this._writeU32(resultPtr, refPtr);
     }
     return napi_ok;
   }
@@ -2133,11 +2213,14 @@ export class NapiRuntime {
     if (val instanceof ArrayBuffer) {
       // Ensure this ArrayBuffer has a guest memory mapping
       if (!this._abMemory.has(val) && val.byteLength > 0) {
-        const guestPtr = this.k.kernel_alloc(val.byteLength);
-        // Copy JS ArrayBuffer content into guest memory
+        const guestAddr = this._guestAlloc(val.byteLength);
+        this._abMemory.set(val, { address: guestAddr, ownership: 1, runtimeAllocated: 1 });
+      }
+      // Always sync JS content to guest memory
+      if (this._abMemory.has(val) && val.byteLength > 0) {
         const base = this._guestBase();
-        new Uint8Array(this._buf()).set(new Uint8Array(val), base + guestPtr);
-        this._abMemory.set(val, { address: guestPtr, ownership: 1, runtimeAllocated: 1 });
+        const info = this._abMemory.get(val);
+        new Uint8Array(this._buf()).set(new Uint8Array(val), base + info.address);
       }
       const info = this._abMemory.get(val);
       if (dataPtr) this._writeU32(dataPtr, info?.address ?? 0);
@@ -2176,7 +2259,22 @@ export class NapiRuntime {
       this._writeU32(typePtr, typeMap[val?.constructor?.name] ?? 1);
     }
     if (lengthPtr) this._writeU32(lengthPtr, val?.length ?? 0);
-    if (dataPtr) this._writeU32(dataPtr, 0);
+    if (dataPtr) {
+      // Get the underlying ArrayBuffer's guest address
+      const ab = val?.buffer;
+      if (ab instanceof ArrayBuffer && !this._abMemory.has(ab) && ab.byteLength > 0) {
+        const guestAddr = this._guestAlloc(ab.byteLength);
+        this._abMemory.set(ab, { address: guestAddr, ownership: 1, runtimeAllocated: 1 });
+      }
+      // Always sync
+      if (ab instanceof ArrayBuffer && this._abMemory.has(ab) && ab.byteLength > 0) {
+        const base = this._guestBase();
+        const info = this._abMemory.get(ab);
+        new Uint8Array(this._buf()).set(new Uint8Array(ab), base + info.address);
+      }
+      const info = this._abMemory.get(ab);
+      this._writeU32(dataPtr, info ? info.address + (val?.byteOffset ?? 0) : 0);
+    }
     if (abPtr) { const h = this._newHandle(val?.buffer); this._writeU32(abPtr, h); }
     if (offsetPtr) this._writeU32(offsetPtr, val?.byteOffset ?? 0);
     return napi_ok;
@@ -2271,6 +2369,8 @@ export class NapiRuntime {
   // Dispatch: find the right method by function name
   dispatch(funcName, args, argsPtr) {
     this._currentArgsPtr = argsPtr;
+    // Capture guest env pointer for use in finalizer callbacks
+    if (args[0] && funcName.startsWith('napi_')) this._guestEnv = args[0];
     // Drain any queued GC finalizers
     if (this._postedFinalizersPending) this._drainFinalizers();
     // env=NULL check

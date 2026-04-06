@@ -229,7 +229,7 @@ describe("Phase 5: Oxide integration", () => {
 });
 
 describe("Phase 5: emnapi Node-API compliance suite", () => {
-  test("all 58 emnapi tests pass", () => {
+  test("all 59 emnapi tests pass", () => {
     const tests = [
       "hello", "arg", "callback", "objfac", "fnfac", "function",
       "constructor", "conversion", "number", "error", "exception",
