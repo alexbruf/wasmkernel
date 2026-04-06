@@ -56,6 +56,8 @@ Module._resolveFilename = function(request, parent, ...rest) {
     '../gc.js': join(__dirname, 'gc.js'),
   };
   if (overrides[request]) return overrides[request];
+  // Shim @emnapi/node-binding — it's optional (only for Node.js async hooks)
+  if (request === '@emnapi/node-binding') return join(__dirname, 'node_binding_shim.js');
   return origResolve.call(this, request, parent, ...rest);
 };
 
