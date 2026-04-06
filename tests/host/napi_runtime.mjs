@@ -2481,7 +2481,7 @@ export class NapiRuntime {
     const ab = this._getHandle(abHandle);
     // Sync guest→JS before creating view (guest may have written data)
     if (ab instanceof ArrayBuffer || ab instanceof SharedArrayBuffer) this._syncGuestToJS(ab);
-    const ctors = [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array, BigInt64Array, BigUint64Array];
+    const ctors = [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array, BigInt64Array, BigUint64Array, typeof Float16Array !== 'undefined' ? Float16Array : Uint16Array];
     const Ctor = ctors[type] ?? Uint8Array;
     const ta = new Ctor(ab, byteOffset, length);
     const h = this._newHandle(ta);
@@ -2493,7 +2493,7 @@ export class NapiRuntime {
     const [env, valueHandle, typePtr, lengthPtr, dataPtr, abPtr, offsetPtr] = args;
     const val = this._getHandle(valueHandle);
     if (typePtr) {
-      const typeMap = { Int8Array: 0, Uint8Array: 1, Uint8ClampedArray: 2, Int16Array: 3, Uint16Array: 4, Int32Array: 5, Uint32Array: 6, Float32Array: 7, Float64Array: 8, BigInt64Array: 9, BigUint64Array: 10 };
+      const typeMap = { Int8Array: 0, Uint8Array: 1, Uint8ClampedArray: 2, Int16Array: 3, Uint16Array: 4, Int32Array: 5, Uint32Array: 6, Float32Array: 7, Float64Array: 8, BigInt64Array: 9, BigUint64Array: 10, Float16Array: 11 };
       this._writeU32(typePtr, typeMap[val?.constructor?.name] ?? 1);
     }
     if (lengthPtr) this._writeU32(lengthPtr, val?.length ?? 0);
