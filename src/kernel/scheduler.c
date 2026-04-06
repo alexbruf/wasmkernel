@@ -315,8 +315,24 @@ wasmkernel_scheduler_step(void)
         /* All threads blocked — check if any could ever wake */
         if (all_threads_exited())
             return 1;
-        /* Deadlock or waiting for I/O — return 0 to let host wait */
-        return 0;
+
+        /* Deadlock: no READY threads but some are BLOCKED_WAIT.
+           Wake them all as spurious wakeups — musl/wasi-libc handles
+           spurious returns from wait32 by rechecking conditions. */
+        bool woke_any = false;
+        for (uint32_t i = 0; i < g_scheduler.num_threads; i++) {
+            WasmKernelThread *t = &g_scheduler.threads[i];
+            if (t->state == THREAD_BLOCKED_WAIT) {
+                t->state = THREAD_READY;
+                t->wait_address = NULL;
+                woke_any = true;
+            }
+        }
+        if (woke_any) {
+            thread = pick_next_thread();
+        }
+        if (!thread)
+            return 0; /* truly stuck (I/O wait) */
     }
 
     thread->state = THREAD_RUNNING;
