@@ -1635,12 +1635,15 @@ export class NapiRuntime {
 
   // napi_get_property_names(env, object, result)
   napi_get_property_names(args) {
+    // Equivalent to get_all_property_names with include_prototypes, enumerable, skip_symbols, numbers_to_strings
     const [env, objectHandle, resultPtr] = args;
     const obj = this._getHandle(objectHandle);
-    const names = Object.keys(obj ?? {});
-    const arr = names.map(n => n);
-    const h = this._newHandle(arr);
-    this._writeResult(resultPtr, h);
+    if (!obj) { this._writeResult(resultPtr, this._newHandle([])); return napi_ok; }
+    const names = [];
+    for (const key in obj) { // for..in includes prototype chain, enumerable only, strings only
+      names.push(key);
+    }
+    this._writeResult(resultPtr, this._newHandle(names));
     return napi_ok;
   }
 
@@ -1648,10 +1651,28 @@ export class NapiRuntime {
   napi_get_all_property_names(args) {
     const [env, objectHandle, keyMode, keyFilter, keyConversion, resultPtr] = args;
     const obj = this._getHandle(objectHandle);
-    // Simplified: return own enumerable string keys
-    const names = obj ? Object.keys(obj) : [];
-    const h = this._newHandle(names);
-    this._writeResult(resultPtr, h);
+    if (!resultPtr) return napi_invalid_arg;
+    if (!obj) { this._writeResult(resultPtr, this._newHandle([])); return napi_ok; }
+    // key_mode: 0=include_prototypes, 1=own_only
+    // key_filter: 1=writable, 2=enumerable, 4=configurable, 8=skip_strings, 16=skip_symbols
+    let names = [];
+    let current = obj;
+    do {
+      for (const key of Reflect.ownKeys(current)) {
+        if (names.includes(key)) continue;
+        const desc = Object.getOwnPropertyDescriptor(current, key);
+        if (keyFilter) {
+          if ((keyFilter & 1) && desc && !desc.writable && !desc.set) continue;
+          if ((keyFilter & 2) && desc && !desc.enumerable) continue;
+          if ((keyFilter & 4) && desc && !desc.configurable) continue;
+          if ((keyFilter & 8) && typeof key === 'string') continue;
+          if ((keyFilter & 16) && typeof key === 'symbol') continue;
+        }
+        names.push(keyConversion === 1 && typeof key === 'number' ? String(key) : key);
+      }
+      current = Object.getPrototypeOf(current);
+    } while (keyMode === 0 && current != null);
+    this._writeResult(resultPtr, this._newHandle(names));
     return napi_ok;
   }
 
