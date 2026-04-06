@@ -814,9 +814,9 @@ export class NapiRuntime {
       queue: [],
     };
     const h = this._newHandle(tsf);
+    this._referencedHandles.add(h); // persistent — survives scope cleanup
+    if (funcHandle) this._referencedHandles.add(funcHandle); // keep JS callback alive
     this._writeResult(resultPtr, h);
-
-    // Don't auto-invoke — napi-rs handles this internally
 
     return napi_ok;
   }
@@ -1408,13 +1408,23 @@ export class NapiRuntime {
     const [tidPtr, entryFuncPtr, argPtr] = args;
     // Build start_args struct in guest memory:
     // { void* stack, void* tls_base, void* (*start_func)(void*), void* start_arg }
-    // Allocate stack (64KB) and TLS (4KB) in guest memory
+    // Allocate stack and TLS within guest's actual memory pages.
+    // Use a bump allocator starting at 1MB (well within 16MB initial memory,
+    // far from the guest's own stack/data which is in first ~200KB).
     const stackSize = 65536;
     const tlsSize = 4096;
-    const stackBase = this._guestAlloc(stackSize);
+    if (!this._threadAllocOffset) this._threadAllocOffset = 1048576; // 1MB
+    // Layout: [argsAddr(16)] [TLS(4K)] [guard(4K)] [STACK(64K)]
+    // Stack grows DOWN from stackTop. Guard gap prevents stack overflow
+    // into TLS/args.
+    const argsAddr = this._threadAllocOffset;
+    this._threadAllocOffset += 16;
+    const tlsBase = this._threadAllocOffset;
+    this._threadAllocOffset += tlsSize;
+    this._threadAllocOffset += 4096; // guard gap
+    const stackBase = this._threadAllocOffset;
+    this._threadAllocOffset += stackSize;
     const stackTop = stackBase + stackSize;
-    const tlsBase = this._guestAlloc(tlsSize);
-    const argsAddr = this._guestAlloc(16);
     const base = this._guestBase();
     const dv = new DataView(this._buf());
     dv.setUint32(base + argsAddr + 0, stackTop, true);    // stack (grows down)
@@ -2322,13 +2332,15 @@ export class NapiRuntime {
   // Threadsafe functions — enhanced implementation
   napi_acquire_threadsafe_function(args) { return napi_ok; }
   napi_get_threadsafe_function_context(args) {
-    const [env, tsfnHandle, resultPtr] = args;
+    // Note: this function takes (tsfn, result) — NO env parameter
+    const [tsfnHandle, resultPtr] = args;
     const tsf = this._getHandle(tsfnHandle);
     this._writeU32(resultPtr, tsf?.context ?? 0);
     return napi_ok;
   }
   napi_call_threadsafe_function(args) {
-    const [env, tsfnHandle, dataPtr, mode] = args;
+    // No env parameter: (tsfn, data, mode)
+    const [tsfnHandle, dataPtr, mode] = args;
     const tsf = this._getHandle(tsfnHandle);
     if (!tsf) return napi_generic_failure;
     // Queue the call — dispatch happens on the main thread via drainTsfnQueue
