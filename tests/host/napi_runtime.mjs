@@ -228,8 +228,10 @@ export class NapiRuntime {
 
   napi_get_value_string_utf8(args) {
     const [env, valueHandle, bufPtr, bufSize, resultPtr] = args;
+    if (!valueHandle) return napi_invalid_arg;
     const value = this._getHandle(valueHandle);
     if (typeof value !== 'string') return napi_string_expected;
+    if (!bufPtr && !resultPtr) return napi_invalid_arg;
     const str = value;
     if (bufPtr && bufSize > 0) {
       const written = this._writeString(bufPtr, bufSize - 1, str);
@@ -542,7 +544,7 @@ export class NapiRuntime {
 
   napi_coerce_to_string(args) {
     const [env, valueHandle, resultPtr] = args;
-    if (!resultPtr) return napi_invalid_arg;
+    if (!valueHandle || !resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
     // V8's ToString() throws for symbols (unlike JS String())
     if (typeof val === 'symbol') {
@@ -563,7 +565,7 @@ export class NapiRuntime {
 
   napi_coerce_to_object(args) {
     const [env, valueHandle, resultPtr] = args;
-    if (!resultPtr) return napi_invalid_arg;
+    if (!valueHandle || !resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
     if (val === null || val === undefined) {
       this.lastException = new TypeError('Cannot convert undefined or null to object');
@@ -702,7 +704,7 @@ export class NapiRuntime {
     const status = this._lastStatus ?? 0;
     const messages = [
       null, 'Invalid argument', 'An object was expected', 'A string was expected',
-      'A name was expected', 'A function was expected', 'A number was expected',
+      'A string or symbol was expected', 'A function was expected', 'A number was expected',
       'A boolean was expected', 'An array was expected', 'Unknown failure',
       'An exception is pending', 'Cancelled', 'napi_escape_called_twice',
     ];
@@ -1209,7 +1211,11 @@ export class NapiRuntime {
   // napi_get_value_string_utf16(env, value, buf, bufsize, result)
   napi_get_value_string_utf16(args) {
     const [env, valueHandle, bufPtr, bufSize, resultPtr] = args;
-    const val = String(this._getHandle(valueHandle) ?? '');
+    if (!valueHandle) return napi_invalid_arg;
+    const v = this._getHandle(valueHandle);
+    if (typeof v !== 'string') return napi_string_expected;
+    if (!bufPtr && !resultPtr) return napi_invalid_arg;
+    const val = v;
     // UTF-16 encoding
     if (bufPtr && bufSize > 0) {
       const base = this._guestBase();
@@ -1228,7 +1234,11 @@ export class NapiRuntime {
   // napi_get_value_string_latin1(env, value, buf, bufsize, result)
   napi_get_value_string_latin1(args) {
     const [env, valueHandle, bufPtr, bufSize, resultPtr] = args;
-    const val = String(this._getHandle(valueHandle) ?? '');
+    if (!valueHandle) return napi_invalid_arg;
+    const v = this._getHandle(valueHandle);
+    if (typeof v !== 'string') return napi_string_expected;
+    if (!bufPtr && !resultPtr) return napi_invalid_arg;
+    const val = v;
     if (bufPtr && bufSize > 0) {
       const base = this._guestBase();
       const writeLen = Math.min(val.length, bufSize - 1);
@@ -1408,7 +1418,7 @@ export class NapiRuntime {
   // napi_coerce_to_bool(env, value, result)
   napi_coerce_to_bool(args) {
     const [env, valueHandle, resultPtr] = args;
-    if (!resultPtr) return napi_invalid_arg;
+    if (!valueHandle || !resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
     const h = this._newHandle(!!val);
     this._writeResult(resultPtr, h);
@@ -1418,7 +1428,7 @@ export class NapiRuntime {
   // napi_coerce_to_number(env, value, result)
   napi_coerce_to_number(args) {
     const [env, valueHandle, resultPtr] = args;
-    if (!resultPtr) return napi_invalid_arg;
+    if (!valueHandle || !resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
     try {
       const h = this._newHandle(Number(val));
