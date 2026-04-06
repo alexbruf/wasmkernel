@@ -121,10 +121,17 @@ export class NapiRuntime {
         new DataView(this._buf()).setUint32(ap, env2, true);        // env
         new DataView(this._buf()).setUint32(ap + 4, data, true);   // finalize_data
         new DataView(this._buf()).setUint32(ap + 8, hint, true);   // finalize_hint
-        const callResult = this.k.kernel_call_indirect(cb, 3, ap);
-        if (callResult === -3) {
-          // Trap in finalizer — the guest function failed (e.g. assert or heap corruption).
-          // Silently continue; the stack pointer was already restored by kernel_call_indirect.
+        this.k.kernel_call_indirect(cb, 3, ap);
+        // If the finalizer's napi_call_function set an exception, propagate it
+        // as uncaughtException (finalizers run outside normal call stacks)
+        if (this.exceptionPending) {
+          const exc = this.lastException;
+          this.lastException = null;
+          this.exceptionPending = false;
+          this._popScope();
+          // Schedule as uncaughtException so it doesn't break the drain loop
+          if (exc) process.nextTick(() => { throw exc; });
+          continue;
         }
         this._popScope();
       } catch { this._popScope(); }
