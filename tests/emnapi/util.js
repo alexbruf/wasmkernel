@@ -159,8 +159,9 @@ exports.load = async function (targetName, options) {
       const s = k.kernel_step()
       if (s !== 0) break // all threads done or blocked
     }
-    // Drain any queued threadsafe function calls
+    // Drain any queued threadsafe function calls and async sends
     napiRuntime.drainTsfnQueue()
+    napiRuntime.drainAsyncSendQueue()
   }, 1)
   // Don't let the stepper keep the process alive
   if (stepper.unref) stepper.unref()

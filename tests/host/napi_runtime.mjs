@@ -1383,6 +1383,28 @@ export class NapiRuntime {
 
   // emnapi-specific functions
   emnapi_is_support_weakref(args) { return 1; } // WeakRef supported
+
+  // emnapi async send — used by spawned threads to send callbacks to main thread
+  _emnapi_async_send_js(args) {
+    const [type, callback, data] = args;
+    // Schedule callback on main thread via kernel_call_indirect
+    // type: 0=setImmediate, 1=nextTick
+    if (!this._asyncSendQueue) this._asyncSendQueue = [];
+    this._asyncSendQueue.push({ callback, data });
+    return 0;
+  }
+
+  // Drain async send queue (called from stepper)
+  drainAsyncSendQueue() {
+    if (!this._asyncSendQueue || !this._asyncSendQueue.length) return;
+    while (this._asyncSendQueue.length > 0) {
+      const { callback, data } = this._asyncSendQueue.shift();
+      // Call the guest callback function with (data) arg
+      const ap = this.k.kernel_alloc(8);
+      new DataView(this._buf()).setUint32(ap, data, true);
+      this.k.kernel_call_indirect(callback, 1, ap);
+    }
+  }
   emnapi_get_memory_address(args) {
     // (env, arraybuffer_or_view, address_out, ownership_out, runtime_allocated_out)
     const [env, valueHandle, addressPtr, ownershipPtr, runtimeAllocatedPtr] = args;
