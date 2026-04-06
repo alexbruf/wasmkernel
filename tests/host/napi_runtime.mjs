@@ -1380,16 +1380,30 @@ export class NapiRuntime {
   napi_create_bigint_words(args) {
     const [env, signBit, wordCount, wordsPtr, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
-    if (wordCount > 1000000) return napi_invalid_arg; // too many words
-    let val = 0n;
-    const base = this._guestBase();
-    for (let i = 0; i < wordCount; i++) {
-      const word = new DataView(this._buf()).getBigUint64(base + wordsPtr + i * 8, true);
-      val += word << (BigInt(i) * 64n);
+    // SIZE_MAX = clearly invalid arg (not a RangeError, just bad input)
+    if (wordCount >= 0xFFFFFFFF) return napi_invalid_arg;
+    // Check if wordCount is too large — would exceed BigInt engine limits
+    const guestSize = this.k.kernel_guest_memory_size();
+    if (wordCount * 8 > guestSize || wordCount > 1000000) {
+      this.lastException = new RangeError('Maximum BigInt size exceeded');
+      this.exceptionPending = true;
+      return napi_pending_exception;
     }
-    if (signBit) val = -val;
-    const h = this._newHandle(val);
-    this._writeResult(resultPtr, h);
+    try {
+      let val = 0n;
+      const base = this._guestBase();
+      for (let i = 0; i < wordCount; i++) {
+        const word = new DataView(this._buf()).getBigUint64(base + wordsPtr + i * 8, true);
+        val += word << (BigInt(i) * 64n);
+      }
+      if (signBit) val = -val;
+      const h = this._newHandle(val);
+      this._writeResult(resultPtr, h);
+    } catch (e) {
+      this.lastException = e;
+      this.exceptionPending = true;
+      return napi_pending_exception;
+    }
     return napi_ok;
   }
 
@@ -2210,12 +2224,11 @@ export class NapiRuntime {
     const [env, valueHandle, resultPtr, losslessPtr] = args;
     const val = this._getHandle(valueHandle);
     const n = typeof val === 'bigint' ? val : 0n;
-    // Write lossless FIRST (it's a bool = 1 byte, may be adjacent to the i64)
+    // Check lossless: value fits in signed int64 (-2^63 to 2^63-1)
     if (losslessPtr) {
-      const base = this._guestBase();
-      new Uint8Array(this._buf())[base + losslessPtr] = 1;
+      const lossless = n >= -9223372036854775808n && n <= 9223372036854775807n;
+      this._writeBool(losslessPtr, lossless);
     }
-    // Then write the i64 value (8 bytes)
     this._writeI64(resultPtr, n);
     return napi_ok;
   }
