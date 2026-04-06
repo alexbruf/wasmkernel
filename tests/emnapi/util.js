@@ -116,6 +116,9 @@ exports.load = async function (targetName, options = {}) {
   const retHandle = new DataView(k.memory.buffer).getUint32(ap, true)
   const result = napiRuntime._getHandle(retHandle) ?? exportsObj
 
+  // Run cleanup hooks at process exit
+  process.on('exit', () => { napiRuntime.runCleanupHooks() })
+
   // Start background stepper for cooperative threads
   result._kernel = k
   result._napiRuntime = napiRuntime

@@ -1221,8 +1221,32 @@ export class NapiRuntime {
   }
 
   // ===== Cleanup hooks =====
-  napi_add_env_cleanup_hook(args) { return napi_ok; }
-  napi_remove_env_cleanup_hook(args) { return napi_ok; }
+  napi_add_env_cleanup_hook(args) {
+    const [env, cbPtr, dataPtr] = args;
+    if (!this._cleanupHooks) this._cleanupHooks = [];
+    this._cleanupHooks.push({ cb: cbPtr, data: dataPtr });
+    return napi_ok;
+  }
+  napi_remove_env_cleanup_hook(args) {
+    const [env, cbPtr, dataPtr] = args;
+    if (this._cleanupHooks) {
+      const idx = this._cleanupHooks.findIndex(h => h.cb === cbPtr && h.data === dataPtr);
+      if (idx >= 0) this._cleanupHooks.splice(idx, 1);
+    }
+    return napi_ok;
+  }
+
+  // Run cleanup hooks (called at process exit)
+  runCleanupHooks() {
+    if (!this._cleanupHooks) return;
+    // Run in reverse order (LIFO)
+    while (this._cleanupHooks.length > 0) {
+      const { cb, data } = this._cleanupHooks.pop();
+      const ap = this.k.kernel_alloc(4);
+      new DataView(this._buf()).setUint32(ap, data, true);
+      this.k.kernel_call_indirect(cb, 1, ap);
+    }
+  }
 
   // ===== Fatal exception =====
   napi_fatal_exception(args) {
@@ -2483,9 +2507,15 @@ export class NapiRuntime {
     if (ab instanceof ArrayBuffer || ab instanceof SharedArrayBuffer) this._syncGuestToJS(ab);
     const ctors = [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array, BigInt64Array, BigUint64Array, typeof Float16Array !== 'undefined' ? Float16Array : Uint16Array];
     const Ctor = ctors[type] ?? Uint8Array;
-    const ta = new Ctor(ab, byteOffset, length);
-    const h = this._newHandle(ta);
-    this._writeResult(resultPtr, h);
+    try {
+      const ta = new Ctor(ab, byteOffset, length);
+      const h = this._newHandle(ta);
+      this._writeResult(resultPtr, h);
+    } catch (e) {
+      this.lastException = e;
+      this.exceptionPending = true;
+      return napi_pending_exception;
+    }
     return napi_ok;
   }
 
