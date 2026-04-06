@@ -16,6 +16,11 @@ if (!testName) { console.error("Usage: run_emnapi_native.mjs <test_name>"); proc
 // Suppress emnapi's global leak checker
 process.env.NODE_TEST_KNOWN_GLOBALS = '0';
 
+// Enable child process support: when tests spawn subprocesses (async, cleanup_hook),
+// the child needs our module resolution overrides. NODE_OPTIONS --require preloads them.
+process.env.NODE_OPTIONS = (process.env.NODE_OPTIONS || '') +
+  ` --require ${join(__dirname, 'child_wrapper.js')}`;
+
 // Find emnapi test file
 const emnapiTestDir = '/tmp/emnapi-repo/packages/test';
 const testFiles = [
