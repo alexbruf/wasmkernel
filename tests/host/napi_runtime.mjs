@@ -22,6 +22,7 @@ const napi_generic_failure = 9;
 const napi_pending_exception = 10;
 const napi_cancelled = 11;
 const napi_escape_called_twice = 12;
+const napi_closing = 16;
 
 // napi_valuetype
 const napi_undefined = 0;
@@ -806,6 +807,10 @@ export class NapiRuntime {
     //       initialThreadCount, threadFinalizeData, threadFinalizeCb,
     //       context, callJsCb, resultPtr
     const funcHandle = args[1];
+    const maxQueueSize = args[4];
+    const initialThreadCount = args[5];
+    const threadFinalizeData = args[6];
+    const threadFinalizeCb = args[7];
     const context = args[8];
     const callJsCb = args[9];
     const resultPtr = args[10];
@@ -816,8 +821,15 @@ export class NapiRuntime {
       context,
       callJsCb,
       queue: [],
+      maxQueueSize,
+      threadCount: initialThreadCount,
+      threadFinalizeCb,
+      threadFinalizeData,
+      closing: false,
+      refed: true,
     };
     const h = this._newHandle(tsf);
+    tsf._handle = h;
     this._referencedHandles.add(h); // persistent — survives scope cleanup
     if (funcHandle) this._referencedHandles.add(funcHandle); // keep JS callback alive
     this._writeResult(resultPtr, h);
@@ -826,6 +838,10 @@ export class NapiRuntime {
   }
 
   napi_unref_threadsafe_function(args) {
+    // (env, tsfn) — env is first arg here
+    const tsfnHandle = args[1];
+    const tsf = this._getHandle(tsfnHandle);
+    if (tsf) tsf.refed = false;
     return napi_ok;
   }
 
@@ -2415,7 +2431,14 @@ export class NapiRuntime {
   }
 
   // Threadsafe functions — enhanced implementation
-  napi_acquire_threadsafe_function(args) { return napi_ok; }
+  napi_acquire_threadsafe_function(args) {
+    // No env: (tsfn)
+    const [tsfnHandle] = args;
+    const tsf = this._getHandle(tsfnHandle);
+    if (!tsf || tsf.closing) return napi_closing;
+    tsf.threadCount++;
+    return napi_ok;
+  }
   napi_get_threadsafe_function_context(args) {
     // Note: this function takes (tsfn, result) — NO env parameter
     const [tsfnHandle, resultPtr] = args;
@@ -2428,6 +2451,7 @@ export class NapiRuntime {
     const [tsfnHandle, dataPtr, mode] = args;
     const tsf = this._getHandle(tsfnHandle);
     if (!tsf) return napi_generic_failure;
+    if (tsf.closing) return napi_closing;
     // Queue the call — dispatch happens on the main thread via drainTsfnQueue
     tsf.queue.push(dataPtr);
     return napi_ok;
@@ -2436,26 +2460,74 @@ export class NapiRuntime {
   // Drain queued threadsafe function calls (called from outside kernel_step)
   drainTsfnQueue() {
     for (const [id, val] of this.handles) {
-      if (val?.type !== 'threadsafe_function' || !val.queue.length) continue;
+      if (val?.type !== 'threadsafe_function') continue;
+      // Process queued calls
       while (val.queue.length > 0) {
         const dataPtr = val.queue.shift();
-        if (val.callJsCb) {
-          // Call the C call_js_cb which will invoke the JS function
-          const argvPtr = this.k.kernel_alloc(16);
-          new DataView(this._buf()).setUint32(argvPtr, this._guestEnv || 1, true);
-          new DataView(this._buf()).setUint32(argvPtr + 4, val.funcHandle, true);
-          new DataView(this._buf()).setUint32(argvPtr + 8, val.context, true);
-          new DataView(this._buf()).setUint32(argvPtr + 12, dataPtr, true);
-          this.k.kernel_call_indirect(val.callJsCb, 4, argvPtr);
-        } else if (val.funcHandle) {
-          // No C callback — call the JS function directly with data
-          const jsFn = this._getHandle(val.funcHandle);
-          if (typeof jsFn === 'function') jsFn(dataPtr);
-        }
+        this._callTsfn(val, dataPtr);
+      }
+      // If closing and queue empty, call finalize
+      if (val.closing && val.threadCount <= 0 && !val._finalized) {
+        val._finalized = true;
+        this._finalizeTsfn(val);
+        // Clean up handle
+        this._referencedHandles.delete(id);
+        if (val.funcHandle) this._referencedHandles.delete(val.funcHandle);
+        this.handles.delete(id);
       }
     }
   }
-  napi_release_threadsafe_function(args) { return napi_ok; }
+
+  _callTsfn(tsf, dataPtr) {
+    if (tsf.callJsCb) {
+      // Call the C call_js_cb(env, js_callback, context, data)
+      const argvPtr = this.k.kernel_alloc(16);
+      new DataView(this._buf()).setUint32(argvPtr, this._guestEnv || 1, true);
+      new DataView(this._buf()).setUint32(argvPtr + 4, tsf.funcHandle, true);
+      new DataView(this._buf()).setUint32(argvPtr + 8, tsf.context, true);
+      new DataView(this._buf()).setUint32(argvPtr + 12, dataPtr, true);
+      this.k.kernel_call_indirect_simple(tsf.callJsCb, 4, argvPtr);
+    } else if (tsf.funcHandle) {
+      // No C callback — default behavior calls JS function with no arguments
+      const jsFn = this._getHandle(tsf.funcHandle);
+      if (typeof jsFn === 'function') jsFn();
+    }
+  }
+
+  _finalizeTsfn(tsf) {
+    if (tsf.threadFinalizeCb) {
+      const ap = this.k.kernel_alloc(12);
+      new DataView(this._buf()).setUint32(ap, this._guestEnv || 1, true);
+      new DataView(this._buf()).setUint32(ap + 4, tsf.threadFinalizeData, true);
+      new DataView(this._buf()).setUint32(ap + 8, tsf.context, true);
+      this.k.kernel_call_indirect_simple(tsf.threadFinalizeCb, 3, ap);
+    }
+  }
+
+  hasPendingTsfn() {
+    for (const [, val] of this.handles) {
+      if (val?.type !== 'threadsafe_function') continue;
+      if (val.queue.length > 0) return true;
+      if (val.closing && !val._finalized) return true;
+    }
+    return false;
+  }
+
+  napi_release_threadsafe_function(args) {
+    // No env: (tsfn, mode) where mode: 0=release, 1=abort
+    const [tsfnHandle, mode] = args;
+    const tsf = this._getHandle(tsfnHandle);
+    if (!tsf) return napi_generic_failure;
+    if (mode === 1) {
+      // napi_tsfn_abort
+      tsf.closing = true;
+    }
+    tsf.threadCount = Math.max(0, tsf.threadCount - 1);
+    if (tsf.threadCount <= 0) {
+      tsf.closing = true;
+    }
+    return napi_ok;
+  }
 
   // Cleanup hooks
   napi_add_async_cleanup_hook(args) {

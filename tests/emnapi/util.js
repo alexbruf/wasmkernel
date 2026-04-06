@@ -130,7 +130,7 @@ exports.load = async function (targetName, options = {}) {
       napiRuntime.drainAsyncQueue()
       // Unref when no more work to do
       if (napiRuntime._pendingAsyncQueue.length === 0
-          && (!napiRuntime._tsfnQueue || napiRuntime._tsfnQueue.length === 0)
+          && !napiRuntime.hasPendingTsfn()
           && stepper.unref) {
         stepper.unref()
       }
@@ -161,6 +161,14 @@ exports.load = async function (targetName, options = {}) {
   const origQueueAsyncWork = napiRuntime.napi_queue_async_work.bind(napiRuntime)
   napiRuntime.napi_queue_async_work = function(args) {
     const r = origQueueAsyncWork(args)
+    if (stepper.ref) stepper.ref()
+    return r
+  }
+
+  // Hook into napi_call_threadsafe_function to ref stepper for TSFN drain
+  const origCallTsfn = napiRuntime.napi_call_threadsafe_function.bind(napiRuntime)
+  napiRuntime.napi_call_threadsafe_function = function(args) {
+    const r = origCallTsfn(args)
     if (stepper.ref) stepper.ref()
     return r
   }

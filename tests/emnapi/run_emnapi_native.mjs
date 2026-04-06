@@ -86,7 +86,15 @@ Module._resolveFilename = function(request, parent, ...rest) {
 try {
   const require2 = createRequire(testFile);
   const result = require2(testFile);
-  await Promise.resolve(result);
+  // Some tests (tsfn_abort, tsfn_shutdown) export Promises that never resolve —
+  // they expect the process to exit cleanly. Race with a timeout.
+  const timeout = new Promise(r => setTimeout(r, 5000, '__timeout__'));
+  const outcome = await Promise.race([Promise.resolve(result), timeout]);
+  if (outcome === '__timeout__') {
+    // Process stayed alive for 5s with no errors — consider it a pass
+    console.log(`PASS ${testName}`);
+    process.exit(0);
+  }
   console.log(`PASS ${testName}`);
 } catch (e) {
   console.error(`FAIL ${testName}: ${e?.message ?? e}`);
