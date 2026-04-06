@@ -951,6 +951,40 @@ kernel_call_indirect(uint32_t table_idx, uint32_t argc, uint32_t argv_ptr)
     return 0;
 }
 
+/* Spawn a guest thread directly (for uv_thread_create bridge).
+ * start_arg is a guest address pointing to:
+ * { uint32 stack, uint32 tls_base, uint32 start_func, uint32 start_arg }
+ * Returns TID on success, negative on error. */
+__attribute__((export_name("kernel_thread_spawn")))
+int32_t
+kernel_thread_spawn(uint32_t start_arg)
+{
+    if (!g_guest_instance || !g_guest_exec_env)
+        return -1;
+
+    /* Call the guest's wasi.thread-spawn import indirectly.
+     * WAMR's thread_spawn_wrapper handles creating the new instance
+     * and registering with our cooperative scheduler. */
+
+    /* We need to call wasm_runtime_call_indirect on the wasi.thread-spawn
+     * import. But imports aren't callable via call_indirect.
+     * Instead, we simulate what the guest would do: call the native
+     * thread_spawn_wrapper directly. */
+    extern int32_t thread_spawn_wrapper(wasm_exec_env_t, uint32_t);
+
+    int32_t tid = thread_spawn_wrapper(g_guest_exec_env, start_arg);
+    return tid;
+}
+
+__attribute__((export_name("kernel_debug_spin_addr")))
+uint32_t kernel_debug_spin_addr(void) {
+    for (uint32_t i = 1; i < g_scheduler.num_threads; i++) {
+        if (g_scheduler.threads[i].exec_env)
+            return g_scheduler.threads[i].exec_env->_spin_addr;
+    }
+    return 0;
+}
+
 __attribute__((export_name("kernel_set_fuel")))
 void
 kernel_set_fuel(uint32_t fuel_per_slice)

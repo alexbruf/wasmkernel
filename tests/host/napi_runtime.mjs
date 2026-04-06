@@ -1403,6 +1403,66 @@ export class NapiRuntime {
   // emnapi-specific functions
   emnapi_is_support_weakref(args) { return 1; } // WeakRef supported
 
+  // uv_thread_create(tid_ptr, entry, arg) — spawn thread via wasi_thread_spawn
+  uv_thread_create(args) {
+    const [tidPtr, entryFuncPtr, argPtr] = args;
+    // Build start_args struct in guest memory:
+    // { void* stack, void* tls_base, void* (*start_func)(void*), void* start_arg }
+    // Allocate stack (64KB) and TLS (4KB) in guest memory
+    const stackSize = 65536;
+    const tlsSize = 4096;
+    const stackBase = this._guestAlloc(stackSize);
+    const stackTop = stackBase + stackSize;
+    const tlsBase = this._guestAlloc(tlsSize);
+    const argsAddr = this._guestAlloc(16);
+    const base = this._guestBase();
+    const dv = new DataView(this._buf());
+    dv.setUint32(base + argsAddr + 0, stackTop, true);    // stack (grows down)
+    dv.setUint32(base + argsAddr + 4, tlsBase, true);      // tls_base
+    dv.setUint32(base + argsAddr + 8, entryFuncPtr, true);  // start_func
+    dv.setUint32(base + argsAddr + 12, argPtr, true);       // start_arg
+
+    // Call wasi.thread-spawn via the kernel
+    // The kernel handles this by creating a new instance and registering
+    // with the cooperative scheduler
+    const spawnArgv = this.k.kernel_alloc(4);
+    new DataView(this._buf()).setUint32(spawnArgv, argsAddr, true);
+    // wasi.thread-spawn is import func[30] in the guest, but we can't call
+    // imports directly. Instead, find the guest's exported call to it.
+
+    // Actually: the guest exports wasi_thread_start. The wasi.thread-spawn
+    // native is handled by WAMR internally. We can trigger it by calling
+    // kernel_call_indirect on a function that calls thread_spawn.
+    // But there's no such exported function.
+
+    // Simpler: use kernel_call with the function name if the guest exports
+    // a thread_spawn wrapper. But it doesn't.
+
+    // The most direct approach: add a kernel export for spawning threads.
+    // For now, let's just call the underlying wasm import directly.
+
+    // WAMR's thread_spawn is a native function. When the guest calls
+    // wasi.thread-spawn(start_arg), WAMR handles it. We need to trigger
+    // this from the host side.
+
+    // We can add a kernel_thread_spawn export that wraps wasi_thread_spawn
+    if (this.k.kernel_thread_spawn) {
+      const tid = this.k.kernel_thread_spawn(argsAddr);
+      if (tidPtr) this._writeU32(tidPtr, tid > 0 ? tid : 0);
+      return tid > 0 ? 0 : -1;
+    }
+
+    // Fallback: return error
+    if (tidPtr) this._writeU32(tidPtr, 0);
+    return -1;
+  }
+
+  uv_thread_join(args) {
+    // Wait for thread to complete — check scheduler
+    // For now, no-op (thread runs cooperatively)
+    return 0;
+  }
+
   // emnapi async send — used by spawned threads to send callbacks to main thread
   _emnapi_async_send_js(args) {
     const [type, callback, data] = args;
@@ -1514,6 +1574,7 @@ export class NapiRuntime {
   napi_create_string_utf16(args) {
     const [env, strPtr, len, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
+    if (len > 0x7FFFFFFF && len !== 0xFFFFFFFF) return napi_invalid_arg;
     const base = this._guestBase();
     const actualLen = len === 0xFFFFFFFF ? -1 : len;
     let str = '';
