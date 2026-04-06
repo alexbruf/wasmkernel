@@ -290,7 +290,7 @@ export class NapiRuntime {
       case 'string': type = napi_string; break;
       case 'symbol': type = napi_symbol; break;
       case 'function': type = napi_function; break;
-      case 'object': type = val === null ? napi_null : napi_object; break;
+      case 'object': type = val === null ? napi_null : (val?.__external ? napi_external : napi_object); break;
       case 'bigint': type = napi_bigint; break;
     }
     this._writeU32(resultPtr, type);
