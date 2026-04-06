@@ -877,9 +877,15 @@ kernel_call_indirect(uint32_t table_idx, uint32_t argc, uint32_t argv_ptr)
     if (global_data)
         saved_sp = *(uint32_t *)global_data;
 
+    /* Enable asyncify for main thread during kernel_call_indirect so
+     * multi-depth callbacks (e.g. pthread_create → wait32) can unwind */
+    extern bool g_main_thread_asyncify_enabled;
+    g_main_thread_asyncify_enabled = true;
+
     /* Ensure plenty of fuel for direct calls */
     g_guest_exec_env->instructions_to_execute = 100000000;
     if (!wasm_runtime_call_indirect(g_guest_exec_env, table_idx, argc, argv)) {
+        g_main_thread_asyncify_enabled = false;
         const char *exc = wasm_runtime_get_exception(g_guest_instance);
         if (exc) {
             fprintf(stderr, "kernel_call_indirect(%u): %s\n", table_idx, exc);
@@ -890,6 +896,58 @@ kernel_call_indirect(uint32_t table_idx, uint32_t argc, uint32_t argv_ptr)
             *(uint32_t *)global_data = saved_sp;
         return -3;
     }
+
+    /* Cooperative scheduling: if the callback blocked (e.g. wait32 inside
+     * pthread_create), step other threads until the block resolves,
+     * then resume via asyncify. */
+    {
+        extern int asyncify_get_state(void);
+        extern void asyncify_stop_unwind(void);
+        extern void asyncify_start_rewind(void *data);
+        extern void *wasmkernel_get_asyncify_buf(wasm_exec_env_t);
+
+        if (asyncify_get_state() == 1) {
+            /* Callback unwound via asyncify (blocked on wait32 etc.) */
+            asyncify_stop_unwind();
+
+            /* Find the main thread in the scheduler */
+            WasmKernelThread *main_thread = NULL;
+            for (uint32_t i = 0; i < g_scheduler.num_threads; i++) {
+                if (g_scheduler.threads[i].exec_env == g_guest_exec_env) {
+                    main_thread = &g_scheduler.threads[i];
+                    break;
+                }
+            }
+
+            /* Step other threads until the main thread is unblocked */
+            if (main_thread) {
+                int max_iters = 100000;
+                while (main_thread->state == THREAD_BLOCKED_WAIT
+                       && --max_iters > 0) {
+                    wasmkernel_scheduler_step();
+                }
+
+                if (main_thread->state != THREAD_BLOCKED_WAIT) {
+                    /* Resume the callback via asyncify rewind */
+                    main_thread->state = THREAD_RUNNING;
+                    WASM_SUSPEND_FLAGS_FETCH_AND(
+                        g_guest_exec_env->suspend_flags,
+                        ~WASM_SUSPEND_FLAG_YIELD);
+
+                    void *abuf = main_thread->asyncify_buf;
+                    asyncify_start_rewind(abuf);
+                    g_guest_exec_env->instructions_to_execute = 100000000;
+                    wasm_runtime_call_indirect(g_guest_exec_env, table_idx,
+                                               argc, argv);
+
+                    if (asyncify_get_state() == 1)
+                        asyncify_stop_unwind();
+                }
+            }
+        }
+    }
+
+    g_main_thread_asyncify_enabled = false;
     return 0;
 }
 

@@ -49,14 +49,17 @@ wasmkernel_scheduler_add_main(wasm_exec_env_t exec_env)
 }
 
 /* Get asyncify data buffer for the thread owning this exec_env.
-   Returns NULL for the main thread (index 0) — main thread uses the
-   old YIELD mechanism which works fine for single-threaded operation. */
+   Returns NULL for the main thread during kernel_step (uses old YIELD).
+   Returns buffer for main thread during kernel_call_indirect (needs
+   asyncify for multi-depth calls like pthread_create → wait32). */
+bool g_main_thread_asyncify_enabled = false;
+
 void *
 wasmkernel_get_asyncify_buf(wasm_exec_env_t exec_env)
 {
     for (uint32_t i = 0; i < g_scheduler.num_threads; i++) {
         if (g_scheduler.threads[i].exec_env == exec_env) {
-            if (i == 0) return NULL; /* main thread — no asyncify */
+            if (i == 0 && !g_main_thread_asyncify_enabled) return NULL;
             uint8_t *buf = g_scheduler.threads[i].asyncify_buf;
             uint32_t *header = (uint32_t *)buf;
             header[0] = (uint32_t)(uintptr_t)(buf + 8);
