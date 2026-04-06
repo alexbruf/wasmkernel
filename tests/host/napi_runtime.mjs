@@ -318,11 +318,13 @@ export class NapiRuntime {
       self._pushScope();
       const argHandles = jsArgs.map(a => self._newHandle(a));
       const cbInfoId = self.nextHandle++;
+      const newTargetHandle = new.target ? self._newHandle(new.target) : 0;
       self.cbInfoStack.push({
         id: cbInfoId,
         thisHandle: self._newHandle(this),
         args: argHandles,
         data: dataPtr,
+        newTarget: newTargetHandle,
       });
       const resultHandle = self._callGuestCallback(tableIdx, 1, cbInfoId);
       self.cbInfoStack.pop();
@@ -471,14 +473,18 @@ export class NapiRuntime {
     const self = this;
     // Create constructor that calls guest callback
     const ctor = function(...jsArgs) {
+      self._pushScope();
       const argHandles = jsArgs.map(a => self._newHandle(a));
       const cbInfoId = self.nextHandle++;
       const thisHandle = self._newHandle(this);
+      // Track new.target for napi_get_new_target
+      const newTargetHandle = new.target ? self._newHandle(new.target) : 0;
       self.cbInfoStack.push({
-        id: cbInfoId, thisHandle, args: argHandles, data: ctorData,
+        id: cbInfoId, thisHandle, args: argHandles, data: ctorData, newTarget: newTargetHandle,
       });
       self._callGuestCallback(ctorCbPtr, 1, cbInfoId);
       self.cbInfoStack.pop();
+      self._popScope();
     };
     Object.defineProperty(ctor, 'name', { value: className });
 
@@ -1281,18 +1287,28 @@ export class NapiRuntime {
   // napi_get_value_external returns data ptr from external objects
   napi_check_object_type_tag(args) {
     const [env, objectHandle, typeTagPtr, resultPtr] = args;
-    // Check if object has the given type tag
     const obj = this._getHandle(objectHandle);
-    const matches = obj && obj._typeTag && typeTagPtr
-      ? obj._typeTag === typeTagPtr  // simplified: compare tag pointers
-      : false;
+    let matches = false;
+    if (obj && obj._typeTagLo !== undefined && typeTagPtr) {
+      // Compare 128-bit tag values (lo + hi u64)
+      const base = this._guestBase();
+      const dv = new DataView(this._buf());
+      const lo = dv.getBigUint64(base + typeTagPtr, true);
+      const hi = dv.getBigUint64(base + typeTagPtr + 8, true);
+      matches = obj._typeTagLo === lo && obj._typeTagHi === hi;
+    }
     this._writeBool(resultPtr, matches);
     return napi_ok;
   }
   napi_type_tag_object(args) {
     const [env, objectHandle, typeTagPtr] = args;
     const obj = this._getHandle(objectHandle);
-    if (obj && typeof obj === 'object') obj._typeTag = typeTagPtr;
+    if (obj && typeof obj === 'object' && typeTagPtr) {
+      const base = this._guestBase();
+      const dv = new DataView(this._buf());
+      obj._typeTagLo = dv.getBigUint64(base + typeTagPtr, true);
+      obj._typeTagHi = dv.getBigUint64(base + typeTagPtr + 8, true);
+    }
     return napi_ok;
   }
 
@@ -1644,9 +1660,9 @@ export class NapiRuntime {
   // napi_get_new_target(env, cbinfo, result)
   napi_get_new_target(args) {
     const [env, cbInfo, resultPtr] = args;
-    // In our bridge, constructors called via `new` don't have new.target tracking
-    // Return undefined for now
-    this._writeResult(resultPtr, this.undefinedHandle);
+    const info = this.cbInfoStack.find(i => i.id === cbInfo) || this.cbInfoStack[this.cbInfoStack.length - 1];
+    const newTarget = info?.newTarget || 0;
+    this._writeResult(resultPtr, newTarget); // 0 = NULL when not called with new
     return napi_ok;
   }
 
