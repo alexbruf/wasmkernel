@@ -130,6 +130,12 @@ export class NapiRuntime {
     this.handles.delete(id);
   }
 
+  // Write a C bool (1 byte) to guest memory
+  _writeBool(guestPtr, value) {
+    if (!guestPtr) return;
+    new Uint8Array(this._buf())[this._guestBase() + guestPtr] = value ? 1 : 0;
+  }
+
   // Guest memory access via kernel
   _guestBase() {
     return this.k.kernel_guest_memory_base();
@@ -387,7 +393,7 @@ export class NapiRuntime {
   napi_is_array(args) {
     const [env, valueHandle, resultPtr] = args;
     const val = this._getHandle(valueHandle);
-    this._writeU32(resultPtr, Array.isArray(val) ? 1 : 0);
+    this._writeBool(resultPtr, Array.isArray(val));
     return napi_ok;
   }
 
@@ -421,7 +427,7 @@ export class NapiRuntime {
     const refId = this.nextRef++;
     this.refs.set(refId, { handle: valueHandle, refcount: initialRefcount });
     // Keep the handle alive across scope boundaries
-    if (initialRefcount > 0) this._referencedHandles.add(valueHandle);
+    this._referencedHandles.add(valueHandle);
     this._writeU32(resultPtr, refId);
     return napi_ok;
   }
@@ -520,7 +526,7 @@ export class NapiRuntime {
     if (!valueHandle || !resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
     if (typeof val !== 'boolean') return napi_boolean_expected;
-    this._writeU32(resultPtr, val ? 1 : 0);
+    this._writeBool(resultPtr, val);
     return napi_ok;
   }
 
@@ -553,6 +559,11 @@ export class NapiRuntime {
     const [env, valueHandle, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
+    if (val === null || val === undefined) {
+      this.lastException = new TypeError('Cannot convert undefined or null to object');
+      this.exceptionPending = true;
+      return napi_pending_exception;
+    }
     const h = this._newHandle(Object(val));
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -618,13 +629,13 @@ export class NapiRuntime {
   napi_is_error(args) {
     const [env, valueHandle, resultPtr] = args;
     const val = this._getHandle(valueHandle);
-    this._writeU32(resultPtr, val instanceof Error ? 1 : 0);
+    this._writeBool(resultPtr, val instanceof Error);
     return napi_ok;
   }
 
   napi_is_exception_pending(args) {
     const [env, resultPtr] = args;
-    this._writeU32(resultPtr, this.exceptionPending ? 1 : 0);
+    this._writeBool(resultPtr, this.exceptionPending);
     return napi_ok;
   }
 
@@ -795,7 +806,7 @@ export class NapiRuntime {
     const obj = this._getHandle(objectHandle);
     const name = this._readNullTermString(namePtr);
     const has = obj && typeof obj === 'object' && name in obj;
-    this._writeU32(resultPtr, has ? 1 : 0);
+    this._writeBool(resultPtr, has);
     return napi_ok;
   }
 
@@ -805,7 +816,7 @@ export class NapiRuntime {
     const obj = this._getHandle(objectHandle);
     const key = this._getHandle(keyHandle);
     const has = obj && typeof obj === 'object' && key in obj;
-    this._writeU32(resultPtr, has ? 1 : 0);
+    this._writeBool(resultPtr, has);
     return napi_ok;
   }
 
@@ -814,7 +825,7 @@ export class NapiRuntime {
     const [env, lhsHandle, rhsHandle, resultPtr] = args;
     const lhs = this._getHandle(lhsHandle);
     const rhs = this._getHandle(rhsHandle);
-    this._writeU32(resultPtr, lhs === rhs ? 1 : 0);
+    this._writeBool(resultPtr, lhs === rhs);
     return napi_ok;
   }
 
@@ -1013,7 +1024,7 @@ export class NapiRuntime {
     const [env, valueHandle, resultPtr] = args;
     const val = this._getHandle(valueHandle);
     const is = Buffer.isBuffer(val) || val?._isGuestBuffer === true;
-    this._writeU32(resultPtr, is ? 1 : 0);
+    this._writeBool(resultPtr, is);
     return napi_ok;
   }
   node_api_create_buffer_from_arraybuffer(args) {
@@ -1120,7 +1131,7 @@ export class NapiRuntime {
   node_api_is_sharedarraybuffer(args) {
     const [env, valueHandle, resultPtr] = args;
     const val = this._getHandle(valueHandle);
-    this._writeU32(resultPtr, val instanceof SharedArrayBuffer ? 1 : 0);
+    this._writeBool(resultPtr, val instanceof SharedArrayBuffer);
     return napi_ok;
   }
   // init_test_null — test helper, no-op
@@ -1165,7 +1176,7 @@ export class NapiRuntime {
     try {
       if (val instanceof ArrayBuffer && val.byteLength === 0 && val._detached) detached = true;
     } catch { detached = true; }
-    this._writeU32(resultPtr, detached ? 1 : 0);
+    this._writeBool(resultPtr, detached);
     return napi_ok;
   }
 
@@ -1488,17 +1499,20 @@ export class NapiRuntime {
   napi_has_element(args) {
     const [env, objectHandle, index, resultPtr] = args;
     const obj = this._getHandle(objectHandle);
-    this._writeU32(resultPtr, obj && index in obj ? 1 : 0);
+    this._writeBool(resultPtr, obj && index in obj);
     return napi_ok;
   }
 
-  // napi_delete_element(env, object, index, result)
+  // napi_delete_element(env, object, index, result) — result is bool* (1 byte)
   napi_delete_element(args) {
     const [env, objectHandle, index, resultPtr] = args;
     const obj = this._getHandle(objectHandle);
     let ok = false;
     if (obj) { ok = delete obj[index]; }
-    if (resultPtr) this._writeU32(resultPtr, ok ? 1 : 0);
+    if (resultPtr) {
+      const base = this._guestBase();
+      new Uint8Array(this._buf())[base + resultPtr] = ok ? 1 : 0;
+    }
     return napi_ok;
   }
 
@@ -1509,7 +1523,7 @@ export class NapiRuntime {
     const key = this._getHandle(keyHandle);
     let ok = false;
     if (obj) { ok = delete obj[key]; }
-    if (resultPtr) this._writeU32(resultPtr, ok ? 1 : 0);
+    if (resultPtr) this._writeBool(resultPtr, ok);
     return napi_ok;
   }
 
@@ -1520,7 +1534,7 @@ export class NapiRuntime {
     const key = this._getHandle(keyHandle);
     if (typeof key !== 'string' && typeof key !== 'symbol') return napi_name_expected;
     const has = obj && Object.prototype.hasOwnProperty.call(obj, key);
-    this._writeU32(resultPtr, has ? 1 : 0);
+    this._writeBool(resultPtr, has);
     return napi_ok;
   }
 
@@ -1550,7 +1564,7 @@ export class NapiRuntime {
     const ctor = this._getHandle(ctorHandle);
     let result = false;
     try { result = obj instanceof ctor; } catch {}
-    this._writeU32(resultPtr, result ? 1 : 0);
+    this._writeBool(resultPtr, result);
     return napi_ok;
   }
 
@@ -1647,7 +1661,7 @@ export class NapiRuntime {
   napi_is_promise(args) {
     const [env, valueHandle, resultPtr] = args;
     const val = this._getHandle(valueHandle);
-    this._writeU32(resultPtr, val instanceof Promise ? 1 : 0);
+    this._writeBool(resultPtr, val instanceof Promise);
     return napi_ok;
   }
 
@@ -1731,7 +1745,7 @@ export class NapiRuntime {
   napi_is_date(args) {
     const [env, valueHandle, resultPtr] = args;
     const val = this._getHandle(valueHandle);
-    this._writeU32(resultPtr, val instanceof Date ? 1 : 0);
+    this._writeBool(resultPtr, val instanceof Date);
     return napi_ok;
   }
 
@@ -1985,7 +1999,7 @@ export class NapiRuntime {
   napi_is_arraybuffer(args) {
     const [env, valueHandle, resultPtr] = args;
     const val = this._getHandle(valueHandle);
-    this._writeU32(resultPtr, val instanceof ArrayBuffer ? 1 : 0);
+    this._writeBool(resultPtr, val instanceof ArrayBuffer);
     return napi_ok;
   }
 
@@ -2014,7 +2028,7 @@ export class NapiRuntime {
   napi_is_typedarray(args) {
     const [env, valueHandle, resultPtr] = args;
     const val = this._getHandle(valueHandle);
-    this._writeU32(resultPtr, ArrayBuffer.isView(val) && !(val instanceof DataView) ? 1 : 0);
+    this._writeBool(resultPtr, ArrayBuffer.isView(val) && !(val instanceof DataView));
     return napi_ok;
   }
 
@@ -2047,7 +2061,7 @@ export class NapiRuntime {
   napi_is_dataview(args) {
     const [env, valueHandle, resultPtr] = args;
     const val = this._getHandle(valueHandle);
-    this._writeU32(resultPtr, val instanceof DataView ? 1 : 0);
+    this._writeBool(resultPtr, val instanceof DataView);
     return napi_ok;
   }
 
