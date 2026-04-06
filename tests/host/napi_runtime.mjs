@@ -90,26 +90,47 @@ export class NapiRuntime {
   // Register a destructor callback for a JS object
   _registerFinalizer(jsObj, finalizeCb, dataPtr, hintPtr, envPtr) {
     if (this._postedFinalizersRegistry && finalizeCb) {
-      this._postedFinalizersRegistry.register(jsObj, { cb: finalizeCb, env: envPtr || this._guestEnv || 1, data: dataPtr, hint: hintPtr });
+      // Track object→refs mapping so we can clear weak refs when finalizer fires
+      if (!this._objToRefIds) this._objToRefIds = new WeakMap();
+      const refIds = this._objToRefIds.get(jsObj) || [];
+      this._objToRefIds.set(jsObj, refIds);
+      this._postedFinalizersRegistry.register(jsObj, {
+        cb: finalizeCb, env: envPtr || this._guestEnv || 1, data: dataPtr, hint: hintPtr,
+        refIds, // shared array — refs added later will appear here
+      });
     }
   }
 
   // Drain queued destructor callbacks (called from dispatch or async)
   _drainFinalizers() {
+    if (this._drainingFinalizers) return; // prevent re-entrancy
+    this._drainingFinalizers = true;
     while (this._postedFinalizers.length > 0) {
-      const { cb, env: envPtr, data, hint } = this._postedFinalizers.shift();
+      const { cb, env: envPtr, data, hint, refIds } = this._postedFinalizers.shift();
       try {
+        // Clear weak refs for this object so napi_get_reference_value returns NULL
+        if (refIds) {
+          for (const rid of refIds) {
+            const ref = this.refs.get(rid);
+            if (ref && ref.weak) ref.value = { deref() { return undefined; } }; // dead ref
+          }
+        }
         this._pushScope();
         const ap = this.k.kernel_alloc(12);
         const env2 = envPtr || this._guestEnv || 1;
         new DataView(this._buf()).setUint32(ap, env2, true);        // env
         new DataView(this._buf()).setUint32(ap + 4, data, true);   // finalize_data
         new DataView(this._buf()).setUint32(ap + 8, hint, true);   // finalize_hint
-        this.k.kernel_call_indirect(cb, 3, ap);
+        const callResult = this.k.kernel_call_indirect(cb, 3, ap);
+        if (callResult === -3) {
+          // Trap in finalizer — the guest function failed (e.g. assert or heap corruption).
+          // Silently continue; the stack pointer was already restored by kernel_call_indirect.
+        }
         this._popScope();
       } catch { this._popScope(); }
     }
     this._postedFinalizersPending = false;
+    this._drainingFinalizers = false;
   }
 
   _pushScope() {
@@ -452,6 +473,11 @@ export class NapiRuntime {
     const storedValue = (initialRefcount === 0 && isObject) ? new WeakRef(value) : value;
     const refPtr = this._allocRefPtr(refId);
     this.refs.set(refId, { handle: valueHandle, value: storedValue, weak: initialRefcount === 0 && isObject, refcount: initialRefcount, ptr: refPtr });
+    // Track weak refs for finalization coordination
+    if (initialRefcount === 0 && isObject && this._objToRefIds) {
+      const ids = this._objToRefIds.get(value);
+      if (ids) ids.push(refId);
+    }
     // Strong ref (refcount > 0): keep handle alive across scopes
     if (initialRefcount > 0) this._referencedHandles.add(valueHandle);
     this._writeU32(resultPtr, refPtr);
@@ -512,7 +538,20 @@ export class NapiRuntime {
     const [env, refPtr, resultPtr] = args;
     const refId = this._resolveRefId(refPtr);
     const ref = this.refs.get(refId);
-    if (ref) ref.refcount = Math.max(0, ref.refcount - 1);
+    if (ref) {
+      ref.refcount = Math.max(0, ref.refcount - 1);
+      // Transition from strong to weak when refcount hits 0
+      if (ref.refcount === 0 && !ref.weak) {
+        const value = ref.value;
+        const isObject = value !== null && (typeof value === 'object' || typeof value === 'function');
+        if (isObject) {
+          ref.value = new WeakRef(value);
+          ref.weak = true;
+        }
+        this._referencedHandles.delete(ref.handle);
+        this.handles.delete(ref.handle); // allow GC
+      }
+    }
     if (resultPtr) this._writeU32(resultPtr, ref ? ref.refcount : 0);
     return napi_ok;
   }
@@ -1887,7 +1926,18 @@ export class NapiRuntime {
     const [env, refPtr, resultPtr] = args;
     const refId = this._resolveRefId(refPtr);
     const ref = this.refs.get(refId);
-    if (ref && ref.refcount !== undefined) ref.refcount++;
+    if (ref && ref.refcount !== undefined) {
+      ref.refcount++;
+      // Transition from weak to strong when refcount goes from 0 to 1
+      if (ref.refcount === 1 && ref.weak) {
+        const value = ref.value.deref();
+        if (value !== undefined) {
+          ref.value = value;
+          ref.weak = false;
+          this._referencedHandles.add(ref.handle);
+        }
+      }
+    }
     if (resultPtr) this._writeU32(resultPtr, ref?.refcount ?? 0);
     return napi_ok;
   }

@@ -148,7 +148,8 @@ static bridge_fn_t g_bridge_fns[MAX_BRIDGE_FUNCS] = {
 };
 
 /* Build raw API signature string from WASMFuncType */
-#include "wasm.h"  /* for WASMModule, WASMImport, WASMFuncType */
+#include "wasm.h"          /* for WASMModule, WASMImport, WASMFuncType */
+#include "wasm_runtime.h"  /* for WASMModuleInstance (global_data access) */
 
 static void
 build_raw_signature(WASMFuncType *ft, char *buf, size_t bufsz)
@@ -863,6 +864,13 @@ kernel_call_indirect(uint32_t table_idx, uint32_t argc, uint32_t argv_ptr)
         return -1;
 
     uint32_t *argv = argv_ptr ? (uint32_t *)(uintptr_t)argv_ptr : NULL;
+    /* Save guest stack pointer (global[0]) — if the call traps, the guest
+     * function may have decremented sp without restoring it, leaking stack. */
+    uint8_t *global_data = ((WASMModuleInstance *)g_guest_instance)->global_data;
+    uint32_t saved_sp = 0;
+    if (global_data)
+        saved_sp = *(uint32_t *)global_data;
+
     /* Ensure plenty of fuel for direct calls */
     g_guest_exec_env->instructions_to_execute = 100000000;
     if (!wasm_runtime_call_indirect(g_guest_exec_env, table_idx, argc, argv)) {
@@ -871,6 +879,9 @@ kernel_call_indirect(uint32_t table_idx, uint32_t argc, uint32_t argv_ptr)
             fprintf(stderr, "kernel_call_indirect(%u): %s\n", table_idx, exc);
             wasm_runtime_clear_exception(g_guest_instance);
         }
+        /* Restore stack pointer to prevent stack leak on trap */
+        if (global_data)
+            *(uint32_t *)global_data = saved_sp;
         return -3;
     }
     return 0;
