@@ -24,7 +24,7 @@ exports.loadPath = function (request, options) {
   return exports.load(require('path').basename(request, '.wasm'), options)
 }
 
-exports.load = async function (targetName, options) {
+exports.load = async function (targetName, options = {}) {
   await napiRuntimePromise
 
   const kernelBytes = fs.readFileSync(kernelPath)
@@ -67,6 +67,7 @@ exports.load = async function (targetName, options) {
   }
 
   const napiRuntime = new NapiRuntime(k)
+  if (options.filename) napiRuntime._moduleFilename = options.filename
 
   // Discover bridges
   const bridgeCount = k.kernel_bridge_count()

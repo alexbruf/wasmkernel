@@ -261,7 +261,7 @@ export class NapiRuntime {
   napi_create_string_utf8(args) {
     const [env, strPtr, len, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
-    // len = -1 means null-terminated; otherwise use len
+    if (len > 0x7FFFFFFF && len !== 0xFFFFFFFF) return napi_invalid_arg; // > INT_MAX
     let str;
     if (len === 0xFFFFFFFF || len === -1) {
       str = this._readNullTermString(strPtr);
@@ -281,8 +281,10 @@ export class NapiRuntime {
     if (!bufPtr && !resultPtr) return napi_invalid_arg;
     const encoded = new TextEncoder().encode(value);
     if (bufPtr && bufSize > 0) {
-      const maxWrite = bufSize - 1; // leave room for null terminator
-      const toWrite = Math.min(encoded.length, maxWrite);
+      const maxWrite = bufSize - 1;
+      // Don't split multi-byte UTF-8 characters
+      let toWrite = Math.min(encoded.length, maxWrite);
+      while (toWrite > 0 && (encoded[toWrite] & 0xC0) === 0x80) toWrite--;
       const base = this._guestBase();
       new Uint8Array(this._buf()).set(encoded.subarray(0, toWrite), base + bufPtr);
       new Uint8Array(this._buf())[base + bufPtr + toWrite] = 0;
@@ -998,6 +1000,7 @@ export class NapiRuntime {
   napi_create_string_latin1(args) {
     const [env, strPtr, len, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
+    if (len > 0x7FFFFFFF && len !== 0xFFFFFFFF) return napi_invalid_arg;
     const base = this._guestBase();
     const mem = new Uint8Array(this._buf());
     let str;
@@ -1225,23 +1228,39 @@ export class NapiRuntime {
   napi_fatal_exception(args) {
     const [env, errorHandle] = args;
     const err = this._getHandle(errorHandle);
-    console.error('FATAL EXCEPTION:', err);
+    // Propagate as uncaughtException (matches Node.js behavior)
+    process.nextTick(() => { throw err; });
     return napi_ok;
   }
 
   // ===== Filename =====
   node_api_get_module_file_name(args) {
     const [env, resultPtr] = args;
-    // Return empty string handle
-    const h = this._newHandle("");
-    this._writeU32(resultPtr, h);
+    // Write a C string pointer to guest memory (not a napi_value)
+    const filename = this._moduleFilename || "";
+    const encoded = new TextEncoder().encode(filename);
+    const guestAddr = this._guestAlloc(encoded.length + 1);
+    const base = this._guestBase();
+    new Uint8Array(this._buf()).set(encoded, base + guestAddr);
+    new Uint8Array(this._buf())[base + guestAddr + encoded.length] = 0;
+    this._writeU32(resultPtr, guestAddr);
     return napi_ok;
   }
 
   // ===== External strings =====
   node_api_create_external_string_latin1(args) {
     const [env, strPtr, length, finalizeCb, finalizeHint, resultPtr, copiedPtr] = args;
-    const str = length === 0xFFFFFFFF ? this._readNullTermString(strPtr) : this._readString(strPtr, length);
+    // Latin1: read bytes and convert via String.fromCharCode (not TextDecoder which is UTF-8)
+    const base = this._guestBase();
+    const mem = new Uint8Array(this._buf());
+    let str;
+    if (length === 0xFFFFFFFF || length === -1) {
+      let end = strPtr;
+      while (mem[base + end] !== 0) end++;
+      str = Array.from(mem.subarray(base + strPtr, base + end), b => String.fromCharCode(b)).join('');
+    } else {
+      str = Array.from(mem.subarray(base + strPtr, base + strPtr + length), b => String.fromCharCode(b)).join('');
+    }
     const h = this._newHandle(str);
     this._writeResult(resultPtr, h);
     if (copiedPtr) this._writeU32(copiedPtr, 1); // we always copy
@@ -2371,8 +2390,7 @@ export class NapiRuntime {
       if (dataPtr) this._writeU32(dataPtr, info?.address ?? 0);
       if (lengthPtr) this._writeU32(lengthPtr, val.byteLength);
     } else {
-      if (dataPtr) this._writeU32(dataPtr, 0);
-      if (lengthPtr) this._writeU32(lengthPtr, 0);
+      return napi_invalid_arg;
     }
     return napi_ok;
   }
