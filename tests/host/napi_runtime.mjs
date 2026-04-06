@@ -1127,9 +1127,22 @@ export class NapiRuntime {
   }
 
   node_api_create_object_with_properties(args) {
-    const [env, resultPtr, propCount, propsPtr] = args;
+    // (env, proto, names_array, values_array, count, result)
+    const [env, protoHandle, namesPtr, valuesPtr, count, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
     const obj = {};
-    this._applyPropertyDescriptors(obj, propCount, propsPtr);
+    if (protoHandle) {
+      const proto = this._getHandle(protoHandle);
+      if (proto) Object.setPrototypeOf(obj, proto);
+    }
+    // Read name/value pairs from guest arrays
+    for (let i = 0; i < count; i++) {
+      const nameHandle = this._readU32(namesPtr + i * 4);
+      const valueHandle = this._readU32(valuesPtr + i * 4);
+      const name = this._getHandle(nameHandle);
+      const value = this._getHandle(valueHandle);
+      if (name != null) obj[name] = value;
+    }
     const h = this._newHandle(obj);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -1547,11 +1560,11 @@ export class NapiRuntime {
     const [env, objectHandle, index, resultPtr] = args;
     const obj = this._getHandle(objectHandle);
     let ok = false;
-    if (obj) { ok = delete obj[index]; }
-    if (resultPtr) {
-      const base = this._guestBase();
-      new Uint8Array(this._buf())[base + resultPtr] = ok ? 1 : 0;
+    if (obj) {
+      try { ok = delete obj[index]; }
+      catch { ok = false; }
     }
+    if (resultPtr) this._writeBool(resultPtr, ok);
     return napi_ok;
   }
 
@@ -1561,7 +1574,10 @@ export class NapiRuntime {
     const obj = this._getHandle(objectHandle);
     const key = this._getHandle(keyHandle);
     let ok = false;
-    if (obj) { ok = delete obj[key]; }
+    if (obj) {
+      try { ok = delete obj[key]; }
+      catch { ok = false; } // strict mode throws for non-configurable
+    }
     if (resultPtr) this._writeBool(resultPtr, ok);
     return napi_ok;
   }
