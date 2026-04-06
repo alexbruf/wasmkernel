@@ -245,6 +245,7 @@ export class NapiRuntime {
 
   napi_set_named_property(args) {
     const [env, objectHandle, namePtr, valueHandle] = args;
+    if (!objectHandle || !namePtr) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     const val = this._getHandle(valueHandle);
     const name = this._readNullTermString(namePtr);
@@ -254,6 +255,7 @@ export class NapiRuntime {
 
   napi_get_named_property(args) {
     const [env, objectHandle, namePtr, resultPtr] = args;
+    if (!objectHandle || !namePtr) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     const name = this._readNullTermString(namePtr);
     const val = obj?.[name];
@@ -264,6 +266,7 @@ export class NapiRuntime {
 
   napi_get_property(args) {
     const [env, objectHandle, keyHandle, resultPtr] = args;
+    if (!objectHandle || !keyHandle || !resultPtr) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     const key = this._getHandle(keyHandle);
     const val = obj?.[key];
@@ -274,6 +277,7 @@ export class NapiRuntime {
 
   napi_set_property(args) {
     const [env, objectHandle, keyHandle, valueHandle] = args;
+    if (!objectHandle || !keyHandle || !valueHandle) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     const key = this._getHandle(keyHandle);
     const val = this._getHandle(valueHandle);
@@ -283,6 +287,7 @@ export class NapiRuntime {
 
   napi_typeof(args) {
     const [env, valueHandle, resultPtr] = args;
+    if (!valueHandle) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
     let type = napi_undefined;
     switch (typeof val) {
@@ -826,6 +831,7 @@ export class NapiRuntime {
   // napi_has_property(env, object, key, result_ptr)
   napi_has_property(args) {
     const [env, objectHandle, keyHandle, resultPtr] = args;
+    if (!objectHandle || !keyHandle) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     const key = this._getHandle(keyHandle);
     const has = obj && typeof obj === 'object' && key in obj;
@@ -1615,6 +1621,7 @@ export class NapiRuntime {
   // napi_instanceof(env, object, constructor, result)
   napi_instanceof(args) {
     const [env, objectHandle, ctorHandle, resultPtr] = args;
+    if (!objectHandle || !ctorHandle) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     const ctor = this._getHandle(ctorHandle);
     let result = false;
