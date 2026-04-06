@@ -434,9 +434,13 @@ export class NapiRuntime {
     const [env, valueHandle, initialRefcount, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
     const refId = this.nextRef++;
-    this.refs.set(refId, { handle: valueHandle, refcount: initialRefcount });
-    // Keep the handle alive across scope boundaries
-    this._referencedHandles.add(valueHandle);
+    const value = this._getHandle(valueHandle);
+    // For weak refs (refcount=0), use WeakRef for objects so they can be GC'd
+    const isObject = value !== null && (typeof value === 'object' || typeof value === 'function');
+    const storedValue = (initialRefcount === 0 && isObject) ? new WeakRef(value) : value;
+    this.refs.set(refId, { handle: valueHandle, value: storedValue, weak: initialRefcount === 0 && isObject, refcount: initialRefcount });
+    // Strong ref (refcount > 0): keep handle alive across scopes
+    if (initialRefcount > 0) this._referencedHandles.add(valueHandle);
     this._writeU32(resultPtr, refId);
     return napi_ok;
   }
@@ -444,7 +448,20 @@ export class NapiRuntime {
   napi_get_reference_value(args) {
     const [env, refId, resultPtr] = args;
     const ref = this.refs.get(refId);
-    this._writeResult(resultPtr, ref ? ref.handle : 0);
+    if (!ref) { this._writeResult(resultPtr, 0); return napi_ok; }
+    // Resolve the value (deref WeakRef for weak references)
+    let value;
+    if (ref.weak) {
+      value = ref.value.deref(); // WeakRef — returns undefined if GC'd
+      if (value === undefined) {
+        this._writeResult(resultPtr, 0); // GC'd — return NULL
+        return napi_ok;
+      }
+    } else {
+      value = ref.value;
+    }
+    const h = this._newHandle(value);
+    this._writeResult(resultPtr, h);
     return napi_ok;
   }
 
@@ -1363,6 +1380,7 @@ export class NapiRuntime {
   napi_create_bigint_words(args) {
     const [env, signBit, wordCount, wordsPtr, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
+    if (wordCount > 1000000) return napi_invalid_arg; // too many words
     let val = 0n;
     const base = this._guestBase();
     for (let i = 0; i < wordCount; i++) {
