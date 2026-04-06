@@ -1380,7 +1380,13 @@ export class NapiRuntime {
 
   // napi_detach_arraybuffer(env, arraybuffer)
   napi_detach_arraybuffer(args) {
-    // Can't truly detach in our bridge, but mark it
+    const [env, abHandle] = args;
+    const val = this._getHandle(abHandle);
+    const ab = val instanceof ArrayBuffer ? val : val?.buffer;
+    if (ab instanceof ArrayBuffer) {
+      try { new MessageChannel().port1.postMessage(null, [ab]); } catch {}
+      ab._detached = true;
+    }
     return napi_ok;
   }
 
@@ -1415,11 +1421,11 @@ export class NapiRuntime {
   napi_is_detached_arraybuffer(args) {
     const [env, valueHandle, resultPtr] = args;
     const val = this._getHandle(valueHandle);
-    // Check if detached by trying to access byteLength
     let detached = false;
-    try {
-      if (val instanceof ArrayBuffer && val.byteLength === 0 && val._detached) detached = true;
-    } catch { detached = true; }
+    const ab = val instanceof ArrayBuffer ? val : val?.buffer;
+    if (ab instanceof ArrayBuffer) {
+      detached = ab.detached === true || ab._detached === true;
+    }
     this._writeBool(resultPtr, detached);
     return napi_ok;
   }
