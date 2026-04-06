@@ -164,6 +164,15 @@ export class NapiRuntime {
     return this.handles.get(id);
   }
 
+  // Sync guest memory → JS ArrayBuffer (call before JS reads AB content)
+  _syncGuestToJS(ab) {
+    const info = this._abMemory.get(ab);
+    if (info && ab.byteLength > 0) {
+      const base = this._guestBase();
+      new Uint8Array(ab).set(new Uint8Array(this._buf(), base + info.address, ab.byteLength));
+    }
+  }
+
   _deleteHandle(id) {
     this.handles.delete(id);
   }
@@ -1124,7 +1133,7 @@ export class NapiRuntime {
     const guestPtr = length > 0 ? this.k.kernel_alloc(length) : 0;
     if (dataPtr) this._writeU32(dataPtr, guestPtr);
     const buf = this._createGuestBuffer(guestPtr, length);
-    this._abMemory.set(buf, { address: guestPtr, ownership: 1, runtimeAllocated: 1 });
+    this._abMemory.set(buf, { address: guestPtr, ownership: 0, runtimeAllocated: 1 });
     const h = this._newHandle(buf);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -1140,7 +1149,7 @@ export class NapiRuntime {
     }
     if (dataPtrOut) this._writeU32(dataPtrOut, guestPtr);
     const buf = this._createGuestBuffer(guestPtr, length);
-    this._abMemory.set(buf, { address: guestPtr, ownership: 1, runtimeAllocated: 1 });
+    this._abMemory.set(buf, { address: guestPtr, ownership: 0, runtimeAllocated: 1 });
     const h = this._newHandle(buf);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -1161,7 +1170,7 @@ export class NapiRuntime {
     // Ensure JS-created buffers have a guest memory mapping
     if (!this._abMemory.has(val) && val.byteLength > 0) {
       const guestAddr = this._guestAlloc(val.byteLength);
-      this._abMemory.set(val, { address: guestAddr, ownership: 1, runtimeAllocated: 1 });
+      this._abMemory.set(val, { address: guestAddr, ownership: 0, runtimeAllocated: 1 });
     }
     // Always sync JS content to guest memory
     if (this._abMemory.has(val) && val.byteLength > 0) {
@@ -1193,8 +1202,16 @@ export class NapiRuntime {
   // ===== SharedArrayBuffer =====
   node_api_create_sharedarraybuffer(args) {
     const [env, byteLength, dataPtr, resultPtr] = args;
+    if (!resultPtr) return napi_invalid_arg;
+    // Allocate in guest-accessible memory (same as napi_create_arraybuffer)
+    const guestAddr = byteLength > 0 ? this._guestAlloc(byteLength) : 0;
+    if (guestAddr) {
+      const base = this._guestBase();
+      new Uint8Array(this._buf()).fill(0, base + guestAddr, base + guestAddr + byteLength);
+    }
     const sab = new SharedArrayBuffer(byteLength);
-    if (dataPtr) this._writeU32(dataPtr, 0);
+    this._abMemory.set(sab, { address: guestAddr, ownership: 0, runtimeAllocated: 1 }); // emnapi_runtime
+    if (dataPtr) this._writeU32(dataPtr, guestAddr);
     const h = this._newHandle(sab);
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -1308,6 +1325,10 @@ export class NapiRuntime {
   napi_create_external_arraybuffer(args) {
     const [env, dataPtr, byteLength, finalizeCb, finalizeHint, resultPtr] = args;
     const ab = new ArrayBuffer(byteLength);
+    // Map to existing guest memory at dataPtr
+    this._abMemory.set(ab, { address: dataPtr, ownership: 0, runtimeAllocated: 0 });
+    // Sync guest → JS (the guest already has data there)
+    this._syncGuestToJS(ab);
     this._registerFinalizer(ab, finalizeCb, dataPtr, finalizeHint);
     const h = this._newHandle(ab);
     this._writeResult(resultPtr, h);
@@ -1329,7 +1350,7 @@ export class NapiRuntime {
       const ab = val?.buffer;
       if (ab instanceof ArrayBuffer && !this._abMemory.has(ab) && ab.byteLength > 0) {
         const guestAddr = this._guestAlloc(ab.byteLength);
-        this._abMemory.set(ab, { address: guestAddr, ownership: 1, runtimeAllocated: 1 });
+        this._abMemory.set(ab, { address: guestAddr, ownership: 0, runtimeAllocated: 1 });
       }
       if (ab instanceof ArrayBuffer && this._abMemory.has(ab) && ab.byteLength > 0) {
         const base = this._guestBase();
@@ -1361,7 +1382,7 @@ export class NapiRuntime {
   }
 
   // emnapi-specific functions
-  emnapi_is_support_weakref(args) { return 0; } // no WeakRef support
+  emnapi_is_support_weakref(args) { return 1; } // WeakRef supported
   emnapi_get_memory_address(args) {
     // (env, arraybuffer_or_view, address_out, ownership_out, runtime_allocated_out)
     const [env, valueHandle, addressPtr, ownershipPtr, runtimeAllocatedPtr] = args;
@@ -1377,7 +1398,28 @@ export class NapiRuntime {
     }
     return napi_ok;
   }
-  emnapi_sync_memory(args) { return napi_ok; }
+  emnapi_sync_memory(args) {
+    // (env, js_to_wasm, arraybuffer_handle_ptr, byte_offset, byte_length)
+    const [env, jsToWasm, abHandlePtr, byteOffset, byteLength] = args;
+    if (!abHandlePtr) return napi_ok;
+    const handleId = this._readU32(abHandlePtr);
+    if (!handleId) return napi_ok;
+    const val = this._getHandle(handleId);
+    const ab = (val instanceof ArrayBuffer || val instanceof SharedArrayBuffer) ? val : val?.buffer;
+    if (!ab) return napi_ok;
+    const info = this._abMemory.get(ab);
+    if (!info || ab.byteLength === 0) return napi_ok;
+    const base = this._guestBase();
+    const offset = byteOffset || 0;
+    const len = (byteLength === 0xFFFFFFFF || !byteLength) ? ab.byteLength - offset : Math.min(byteLength, ab.byteLength - offset);
+    if (len <= 0) return napi_ok;
+    if (jsToWasm) {
+      new Uint8Array(this._buf(), base + info.address + offset, len).set(new Uint8Array(ab, offset, len));
+    } else {
+      new Uint8Array(ab, offset, len).set(new Uint8Array(this._buf(), base + info.address + offset, len));
+    }
+    return napi_ok;
+  }
 
   // napi_get_value_string_utf16(env, value, buf, bufsize, result)
   napi_get_value_string_utf16(args) {
@@ -2258,7 +2300,7 @@ export class NapiRuntime {
       new Uint8Array(this._buf()).fill(0, base + guestAddr, base + guestAddr + byteLength);
     }
     const ab = new ArrayBuffer(byteLength);
-    this._abMemory.set(ab, { address: guestAddr, ownership: 1, runtimeAllocated: 1 });
+    this._abMemory.set(ab, { address: guestAddr, ownership: 0, runtimeAllocated: 1 }); // emnapi_runtime
     if (dataPtr) this._writeU32(dataPtr, guestAddr);
     const h = this._newHandle(ab);
     this._writeResult(resultPtr, h);
@@ -2275,11 +2317,11 @@ export class NapiRuntime {
   napi_get_arraybuffer_info(args) {
     const [env, valueHandle, dataPtr, lengthPtr] = args;
     const val = this._getHandle(valueHandle);
-    if (val instanceof ArrayBuffer) {
-      // Ensure this ArrayBuffer has a guest memory mapping
+    if (val instanceof ArrayBuffer || val instanceof SharedArrayBuffer) {
+      // Ensure this ArrayBuffer/SharedArrayBuffer has a guest memory mapping
       if (!this._abMemory.has(val) && val.byteLength > 0) {
         const guestAddr = this._guestAlloc(val.byteLength);
-        this._abMemory.set(val, { address: guestAddr, ownership: 1, runtimeAllocated: 1 });
+        this._abMemory.set(val, { address: guestAddr, ownership: 0, runtimeAllocated: 1 });
       }
       // Always sync JS content to guest memory
       if (this._abMemory.has(val) && val.byteLength > 0) {
@@ -2308,6 +2350,8 @@ export class NapiRuntime {
     const [env, type, length, abHandle, byteOffset, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
     const ab = this._getHandle(abHandle);
+    // Sync guest→JS before creating view (guest may have written data)
+    if (ab instanceof ArrayBuffer || ab instanceof SharedArrayBuffer) this._syncGuestToJS(ab);
     const ctors = [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array, BigInt64Array, BigUint64Array];
     const Ctor = ctors[type] ?? Uint8Array;
     const ta = new Ctor(ab, byteOffset, length);
@@ -2329,7 +2373,7 @@ export class NapiRuntime {
       const ab = val?.buffer;
       if (ab instanceof ArrayBuffer && !this._abMemory.has(ab) && ab.byteLength > 0) {
         const guestAddr = this._guestAlloc(ab.byteLength);
-        this._abMemory.set(ab, { address: guestAddr, ownership: 1, runtimeAllocated: 1 });
+        this._abMemory.set(ab, { address: guestAddr, ownership: 0, runtimeAllocated: 1 });
       }
       // Always sync
       if (ab instanceof ArrayBuffer && this._abMemory.has(ab) && ab.byteLength > 0) {
