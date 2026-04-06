@@ -270,14 +270,18 @@ export class NapiRuntime {
     const value = this._getHandle(valueHandle);
     if (typeof value !== 'string') return napi_string_expected;
     if (!bufPtr && !resultPtr) return napi_invalid_arg;
-    const str = value;
+    const encoded = new TextEncoder().encode(value);
     if (bufPtr && bufSize > 0) {
-      const written = this._writeString(bufPtr, bufSize - 1, str);
-      // Null-terminate
+      const maxWrite = bufSize - 1; // leave room for null terminator
+      const toWrite = Math.min(encoded.length, maxWrite);
       const base = this._guestBase();
-      new Uint8Array(this._buf())[base + bufPtr + written] = 0;
+      new Uint8Array(this._buf()).set(encoded.subarray(0, toWrite), base + bufPtr);
+      new Uint8Array(this._buf())[base + bufPtr + toWrite] = 0;
+      if (resultPtr) this._writeU32(resultPtr, toWrite);
+    } else if (resultPtr) {
+      // No buffer — just report the full byte length needed
+      this._writeU32(resultPtr, encoded.length);
     }
-    if (resultPtr) this._writeU32(resultPtr, str.length);
     return napi_ok;
   }
 
@@ -985,13 +989,16 @@ export class NapiRuntime {
   napi_create_string_latin1(args) {
     const [env, strPtr, len, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
-    // Latin1 is essentially the same as reading bytes
-    const actualLen = (len === 0xFFFFFFFF) ? undefined : len;
+    const base = this._guestBase();
+    const mem = new Uint8Array(this._buf());
     let str;
-    if (actualLen === undefined) {
-      str = this._readNullTermString(strPtr);
+    if (len === 0xFFFFFFFF || len === -1) {
+      // null-terminated
+      let end = strPtr;
+      while (mem[base + end] !== 0) end++;
+      str = Array.from(mem.subarray(base + strPtr, base + end), b => String.fromCharCode(b)).join('');
     } else {
-      str = this._readString(strPtr, actualLen);
+      str = Array.from(mem.subarray(base + strPtr, base + strPtr + len), b => String.fromCharCode(b)).join('');
     }
     const h = this._newHandle(str);
     this._writeResult(resultPtr, h);
@@ -1390,8 +1397,10 @@ export class NapiRuntime {
       }
       // null terminate
       new DataView(this._buf()).setUint16(base + bufPtr + writeLen * 2, 0, true);
+      if (resultPtr) this._writeU32(resultPtr, writeLen);
+    } else if (resultPtr) {
+      this._writeU32(resultPtr, val.length);
     }
-    if (resultPtr) this._writeU32(resultPtr, val.length);
     return napi_ok;
   }
 
@@ -1411,8 +1420,10 @@ export class NapiRuntime {
         mem[base + bufPtr + i] = val.charCodeAt(i) & 0xFF;
       }
       mem[base + bufPtr + writeLen] = 0;
+      if (resultPtr) this._writeU32(resultPtr, writeLen);
+    } else if (resultPtr) {
+      this._writeU32(resultPtr, val.length);
     }
-    if (resultPtr) this._writeU32(resultPtr, val.length);
     return napi_ok;
   }
 
@@ -2239,19 +2250,16 @@ export class NapiRuntime {
   napi_create_arraybuffer(args) {
     const [env, byteLength, dataPtr, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
-    // Allocate in guest memory — use a snapshot ArrayBuffer for JS side
-    const guestPtr = byteLength > 0 ? this.k.kernel_alloc(byteLength) : 0;
+    // Allocate in guest-accessible memory
+    const guestAddr = byteLength > 0 ? this._guestAlloc(byteLength) : 0;
     // Zero-initialize
-    if (guestPtr) {
+    if (guestAddr) {
       const base = this._guestBase();
-      new Uint8Array(this._buf()).fill(0, base + guestPtr, base + guestPtr + byteLength);
+      new Uint8Array(this._buf()).fill(0, base + guestAddr, base + guestAddr + byteLength);
     }
     const ab = new ArrayBuffer(byteLength);
-    ab._guestPtr = guestPtr;
-    ab._guestLength = byteLength;
-    ab._kernel = this;
-    this._abMemory.set(ab, { address: guestPtr, ownership: 1, runtimeAllocated: 1 });
-    if (dataPtr) this._writeU32(dataPtr, guestPtr);
+    this._abMemory.set(ab, { address: guestAddr, ownership: 1, runtimeAllocated: 1 });
+    if (dataPtr) this._writeU32(dataPtr, guestAddr);
     const h = this._newHandle(ab);
     this._writeResult(resultPtr, h);
     return napi_ok;
