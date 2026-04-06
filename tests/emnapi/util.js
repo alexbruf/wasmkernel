@@ -80,7 +80,7 @@ exports.load = async function (targetName, options) {
       if (bytes[j] === 0) { parts.push(new TextDecoder().decode(bytes.slice(start, j))); start = j + 1 }
     }
     const [mod, field] = parts
-    if ((mod === 'env' || mod === 'emnapi') && napiRuntime[field]) {
+    if ((mod === 'env' || mod === 'emnapi' || mod === 'napi') && napiRuntime[field]) {
       const fn = field
       bridgeFunctions.set(i, (args, argsPtr) => napiRuntime.dispatch(fn, args, argsPtr))
     } else {
