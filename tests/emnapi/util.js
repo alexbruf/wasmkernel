@@ -92,22 +92,9 @@ exports.load = async function (targetName, options) {
   let status = 0
   while (status === 0) status = k.kernel_step()
 
-  // Fix: emnapi-mt's _initialize may leave pthread's __tl_lock held (value=2)
-  // because the single-threaded init path doesn't properly release it.
-  // We reset any held futex-style locks (value==2) in the low data section.
-  // This is safe because value 2 means "locked with waiters" which can't
-  // legitimately exist when only one thread has run.
-  {
-    const gBase = k.kernel_guest_memory_base()
-    const gSize = k.kernel_guest_memory_size()
-    const scanEnd = Math.min(gSize, 262144) // scan first 256KB
-    const dv = new DataView(k.memory.buffer)
-    for (let a = 0; a < scanEnd; a += 4) {
-      if (dv.getInt32(gBase + a, true) === 2) {
-        dv.setInt32(gBase + a, 0, true)
-      }
-    }
-  }
+  // Note: removed blanket clearStuckLocks — zeroing all values of 2 in
+  // guest memory was destroying legitimate data. The deadlock detection
+  // (spurious wakeup) in the scheduler handles stuck locks properly now.
 
   // Register napi module
   const exportsObj = {}
@@ -129,20 +116,6 @@ exports.load = async function (targetName, options) {
   const result = napiRuntime._getHandle(retHandle) ?? exportsObj
 
   // Start background stepper for cooperative threads
-  // Helper: clear any pthread futex locks stuck at value 2
-  // (happens when pthread_create's lock release uses notify but no waiter exists yet)
-  function clearStuckLocks() {
-    const gBase = k.kernel_guest_memory_base()
-    const gSize = k.kernel_guest_memory_size()
-    const scanEnd = Math.min(gSize, 262144)
-    const dv = new DataView(k.memory.buffer)
-    for (let a = 0; a < scanEnd; a += 4) {
-      if (dv.getInt32(gBase + a, true) === 2) {
-        dv.setInt32(gBase + a, 0, true)
-      }
-    }
-  }
-
   result._kernel = k
   result._napiRuntime = napiRuntime
   const stepper = setInterval(() => {
@@ -151,9 +124,6 @@ exports.load = async function (targetName, options) {
       napiRuntime.drainTsfnQueue()
       return
     }
-    // Clear stuck pthread locks before stepping (cooperative scheduling
-    // can leave futex locks held because notify has no waiter yet)
-    clearStuckLocks()
     // Run a batch of steps to give threads time
     for (let i = 0; i < 100; i++) {
       const s = k.kernel_step()
