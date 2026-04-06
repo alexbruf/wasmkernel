@@ -285,15 +285,33 @@ wasmkernel_scheduler_step(void)
                                  ~WASM_SUSPEND_FLAG_YIELD);
 
     if (!thread->started) {
-        /* First run: call the thread's start routine */
+        /* First run */
         thread->started = true;
 
+        wasm_module_inst_t inst = wasm_runtime_get_module_inst(
+            thread->exec_env);
+
         if (thread->start_routine) {
-            thread->start_routine(thread->exec_env);
+            /* Spawned thread: call wasi_thread_start directly via
+               wasm_runtime_call_wasm (not through lib-wasi-threads's
+               thread_start, which doesn't handle yield/resume).
+               The ThreadStartArg is stored in exec_env->thread_arg. */
+            wasm_function_inst_t wasi_start =
+                wasm_runtime_lookup_function(inst, "wasi_thread_start");
+            void *targ = thread->exec_env->thread_arg;
+            if (wasi_start && targ) {
+                /* ThreadStartArg: { func_ptr(4), arg(4), thread_id(4) } */
+                uint32_t arg = *(uint32_t *)((char *)targ + 4);
+                int32_t tid = *(int32_t *)((char *)targ + 8);
+                uint32_t argv[2] = { (uint32_t)tid, arg };
+                wasm_exec_env_set_thread_info(thread->exec_env);
+                wasm_runtime_call_wasm(thread->exec_env, wasi_start, 2, argv);
+            } else {
+                /* Fallback: call start_routine directly (old behavior) */
+                thread->start_routine(thread->exec_env);
+            }
         } else {
             /* Main thread: look up entry point */
-            wasm_module_inst_t inst = wasm_runtime_get_module_inst(
-                thread->exec_env);
             wasm_function_inst_t start_func =
                 wasm_runtime_lookup_function(inst, "_start");
             if (!start_func)
@@ -318,12 +336,16 @@ wasmkernel_scheduler_step(void)
 
         wasm_module_inst_t inst = wasm_runtime_get_module_inst(
             thread->exec_env);
-        /* function arg doesn't matter for resume path */
+        /* Function arg doesn't matter for resume (YIELD flag causes
+           interpreter to restore from saved frame). Try multiple names. */
         wasm_function_inst_t func =
             wasm_runtime_lookup_function(inst, "_start");
         if (!func)
+            func = wasm_runtime_lookup_function(inst, "wasi_thread_start");
+        if (!func)
             func = wasm_runtime_lookup_function(inst, "__main_argc_argv");
-        wasm_runtime_call_wasm(thread->exec_env, func, 0, NULL);
+        if (func)
+            wasm_runtime_call_wasm(thread->exec_env, func, 0, NULL);
     }
 
     /* Determine what happened */

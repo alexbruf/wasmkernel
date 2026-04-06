@@ -2229,16 +2229,32 @@ export class NapiRuntime {
     const [env, tsfnHandle, dataPtr, mode] = args;
     const tsf = this._getHandle(tsfnHandle);
     if (!tsf) return napi_generic_failure;
-    // Call the JS callback if set, or invoke callJsCb
-    if (tsf.callJsCb) {
-      const argvPtr = this.k.kernel_alloc(16);
-      new DataView(this._buf()).setUint32(argvPtr, 1, true);        // env
-      new DataView(this._buf()).setUint32(argvPtr + 4, tsf.funcHandle, true); // js_callback
-      new DataView(this._buf()).setUint32(argvPtr + 8, tsf.context, true);    // context
-      new DataView(this._buf()).setUint32(argvPtr + 12, dataPtr, true);       // data
-      this.k.kernel_call_indirect(tsf.callJsCb, 4, argvPtr);
-    }
+    // Queue the call — dispatch happens on the main thread via drainTsfnQueue
+    tsf.queue.push(dataPtr);
     return napi_ok;
+  }
+
+  // Drain queued threadsafe function calls (called from outside kernel_step)
+  drainTsfnQueue() {
+    for (const [id, val] of this.handles) {
+      if (val?.type !== 'threadsafe_function' || !val.queue.length) continue;
+      while (val.queue.length > 0) {
+        const dataPtr = val.queue.shift();
+        if (val.callJsCb) {
+          // Call the C call_js_cb which will invoke the JS function
+          const argvPtr = this.k.kernel_alloc(16);
+          new DataView(this._buf()).setUint32(argvPtr, this._guestEnv || 1, true);
+          new DataView(this._buf()).setUint32(argvPtr + 4, val.funcHandle, true);
+          new DataView(this._buf()).setUint32(argvPtr + 8, val.context, true);
+          new DataView(this._buf()).setUint32(argvPtr + 12, dataPtr, true);
+          this.k.kernel_call_indirect(val.callJsCb, 4, argvPtr);
+        } else if (val.funcHandle) {
+          // No C callback — call the JS function directly with data
+          const jsFn = this._getHandle(val.funcHandle);
+          if (typeof jsFn === 'function') jsFn(dataPtr);
+        }
+      }
+    }
   }
   napi_release_threadsafe_function(args) { return napi_ok; }
 
