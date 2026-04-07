@@ -97,6 +97,21 @@ exports.load = async function (targetName, options = {}) {
   // guest memory was destroying legitimate data. The deadlock detection
   // (spurious wakeup) in the scheduler handles stuck locks properly now.
 
+  // Read NAPI version from guest export (if available).
+  // Use kernel_call which returns -2 for missing functions (no error output needed).
+  if (k.kernel_has_function) {
+    const vn = k.kernel_alloc(40)
+    const vnBytes = new TextEncoder().encode('node_api_module_get_api_version_v1')
+    new Uint8Array(k.memory.buffer, vn, vnBytes.length).set(vnBytes)
+    new Uint8Array(k.memory.buffer)[vn + vnBytes.length] = 0
+    if (k.kernel_has_function(vn)) {
+      const vap = k.kernel_alloc(4)
+      if (k.kernel_call(vn, vap, 0) === 0) {
+        napiRuntime._napiVersion = new DataView(k.memory.buffer).getUint32(vap, true)
+      }
+    }
+  }
+
   // Register napi module
   const exportsObj = {}
   const exportsHandle = napiRuntime._newHandle(exportsObj)

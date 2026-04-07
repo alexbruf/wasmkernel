@@ -499,8 +499,16 @@ export class NapiRuntime {
   napi_create_reference(args) {
     const [env, valueHandle, initialRefcount, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
-    const refId = this.nextRef++;
     const value = this._getHandle(valueHandle);
+    // NAPI v9 and below: only objects/functions/symbols can be referenced
+    if (this._napiVersion && this._napiVersion <= 9) {
+      const t = typeof value;
+      if (value === null || value === undefined
+          || (t !== 'object' && t !== 'function' && t !== 'symbol')) {
+        return napi_invalid_arg;
+      }
+    }
+    const refId = this.nextRef++;
     // For weak refs (refcount=0), use WeakRef for objects so they can be GC'd
     const isObject = value !== null && (typeof value === 'object' || typeof value === 'function');
     const storedValue = (initialRefcount === 0 && isObject) ? new WeakRef(value) : value;
@@ -550,7 +558,7 @@ export class NapiRuntime {
     const [env, refPtr, resultPtr] = args;
     const refId = this._resolveRefId(refPtr);
     const ref = this.refs.get(refId);
-    if (!ref) { this._writeResult(resultPtr, 0); return napi_ok; }
+    if (!ref || ref.released) { this._writeResult(resultPtr, 0); return napi_ok; }
     // Resolve the value (deref WeakRef for weak references)
     let value;
     if (ref.weak) {
@@ -576,10 +584,18 @@ export class NapiRuntime {
       // Transition from strong to weak when refcount hits 0
       if (ref.refcount === 0 && !ref.weak) {
         const value = ref.value;
-        const isObject = value !== null && (typeof value === 'object' || typeof value === 'function');
-        if (isObject) {
+        // Symbols are not weakable in our runtime (supportWeakSymbol=false)
+        const isWeakable = value !== null && value !== undefined
+          && (typeof value === 'object' || typeof value === 'function');
+        if (isWeakable) {
           ref.value = new WeakRef(value);
           ref.weak = true;
+        } else if (typeof value === 'symbol') {
+          // Symbols stay as strong refs (not weakable in our runtime)
+        } else {
+          // Non-weakable types (primitives) are released immediately
+          ref.value = undefined;
+          ref.released = true;
         }
         this._referencedHandles.delete(ref.handle);
         this.handles.delete(ref.handle); // allow GC

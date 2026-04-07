@@ -840,6 +840,15 @@ kernel_exit_code(void)
  * argv_ptr: pointer to uint32 args array in kernel memory
  * argc: number of arguments
  * Returns: 0 on success, sets up scheduler for stepped execution if needed */
+__attribute__((export_name("kernel_has_function")))
+int32_t
+kernel_has_function(uint32_t func_name_ptr)
+{
+    if (!g_guest_instance) return 0;
+    const char *n = (const char *)(uintptr_t)func_name_ptr;
+    return wasm_runtime_lookup_function(g_guest_instance, n) ? 1 : 0;
+}
+
 __attribute__((export_name("kernel_call")))
 int32_t
 kernel_call(uint32_t func_name_ptr, uint32_t argv_ptr, uint32_t argc)
