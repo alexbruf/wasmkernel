@@ -115,8 +115,9 @@ try {
   const require2 = createRequire(testFile);
   const result = require2(testFile);
   // Some tests (tsfn_abort, tsfn_shutdown) export Promises that never resolve —
-  // they expect the process to exit cleanly. Race with a timeout.
-  const timeout = new Promise(r => setTimeout(r, 5000, '__timeout__'));
+  // they expect the process to exit cleanly. Race with a timeout. The async
+  // test does multiple sleep(1)s which can take 5+ seconds total.
+  const timeout = new Promise(r => setTimeout(r, 20000, '__timeout__'));
   const outcome = await Promise.race([Promise.resolve(result), timeout]);
   if (outcome === '__timeout__') {
     // Process stayed alive for 5s with no errors — consider it a pass

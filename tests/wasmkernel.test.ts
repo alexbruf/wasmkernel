@@ -276,5 +276,5 @@ describe("Phase 5: emnapi Node-API compliance suite", () => {
     const json = JSON.parse(result.stdout.trim().split("\n").pop()!);
     expect(json.failed).toBe(0);
     expect(json.passed).toBe(tests.length);
-  }, 600000);
+  }, 900000); // 15 minutes — real sleep() makes several tests take 5-10s each
 });

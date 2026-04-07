@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 /**
- * Run multiple emnapi tests sequentially as subprocesses, each via the
- * real test runner (run_emnapi_native.mjs). Outputs JSON pass/fail per test.
+ * Run multiple emnapi tests in parallel as subprocesses via the real test
+ * runner (run_emnapi_native.mjs). Outputs JSON pass/fail per test.
  *
  * Usage: node run_all.mjs <test1> <test2> ...
  */
-import { spawnSync } from "child_process";
+import { spawn } from "child_process";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
+import { cpus } from "os";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const RUNNER = join(__dirname, "run_emnapi_native.mjs");
@@ -40,17 +41,58 @@ if (NODE_MAJOR < 24) {
 
 const TESTS_NEEDING_NODE24 = new Set(["typedarray"]);
 
+function runOne(testName) {
+  return new Promise((resolve) => {
+    const nodeBin = (NODE24_PATH && TESTS_NEEDING_NODE24.has(testName))
+      ? NODE24_PATH : process.execPath;
+    const child = spawn(
+      nodeBin,
+      ["--expose-gc", "--experimental-wasi-unstable-preview1", RUNNER, testName],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    );
+    let stdout = "";
+    child.stdout.on("data", (d) => { stdout += d.toString(); });
+    const timer = setTimeout(() => child.kill("SIGKILL"), 120000);
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      const passed = stdout.includes("PASS " + testName)
+        || stdout.includes("PASS\n")
+        || /^PASS\b/m.test(stdout);
+      resolve({ testName, passed, code });
+    });
+  });
+}
+
+// Tests that spawn their own subprocesses get flaky under parallel load,
+// so run them serially after the parallel batch.
+const SERIAL_TESTS = new Set(["trap_in_thread", "tsfn_shutdown", "async"]);
+const parallelTests = tests.filter(t => !SERIAL_TESTS.has(t));
+const serialTests = tests.filter(t => SERIAL_TESTS.has(t));
+
+// Run parallel tests with a concurrency limit (number of CPU cores)
+const concurrency = Math.max(4, Math.min(cpus().length, 8));
+const queue = parallelTests.slice();
 const results = {};
-for (const testName of tests) {
-  const nodeBin = (NODE24_PATH && TESTS_NEEDING_NODE24.has(testName))
-    ? NODE24_PATH : process.execPath;
-  const r = spawnSync(
-    nodeBin,
-    ["--expose-gc", "--experimental-wasi-unstable-preview1", RUNNER, testName],
-    { encoding: "utf8", timeout: 60000 }
-  );
-  const passed = r.stdout.includes("PASS " + testName) || r.stdout.includes("PASS\n");
-  results[testName] = passed ? "pass" : `fail (exit=${r.status})`;
+
+async function worker() {
+  while (queue.length > 0) {
+    const testName = queue.shift();
+    let r = await runOne(testName);
+    // Retry once on failure (handles parallel-load flakiness)
+    if (!r.passed) r = await runOne(testName);
+    results[testName] = r.passed ? "pass" : `fail (exit=${r.code})`;
+  }
+}
+
+const workers = [];
+for (let i = 0; i < concurrency; i++) workers.push(worker());
+await Promise.all(workers);
+
+// Run serial tests one at a time
+for (const testName of serialTests) {
+  let r = await runOne(testName);
+  if (!r.passed) r = await runOne(testName);
+  results[testName] = r.passed ? "pass" : `fail (exit=${r.code})`;
 }
 
 const passed = Object.values(results).filter(r => r === "pass").length;

@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <errno.h>
 
 /* Global scheduler instance */
 WasmKernelScheduler g_scheduler;
@@ -521,11 +522,30 @@ wasmkernel_scheduler_block_on_poll_clock(wasm_exec_env_t exec_env,
                                           uint64_t userdata)
 {
     /* When called from kernel_call_indirect_simple (non-cooperative context),
-     * don't block — just write the event result and return immediately.
-     * This makes sleep() a no-op in async Execute callbacks, matching the
-     * behavior of a background thread that ran instantly. */
+     * we can't yield — the host has called us synchronously expecting the
+     * guest function to run to completion. Actually wait for the deadline
+     * via nanosleep, then write the event result and return. This preserves
+     * sleep() semantics for guest code (e.g. async work Execute callbacks)
+     * without breaking the synchronous call contract.
+     *
+     * For cooperative threads, fall through to the normal block-and-yield
+     * path so other threads can run during the wait. */
     extern bool g_main_thread_asyncify_enabled;
     if (!g_main_thread_asyncify_enabled && g_scheduler.threads[0].exec_env == exec_env) {
+        /* Compute remaining time and sleep on the host. */
+        uint64_t now_us = get_time_us();
+        if (deadline_us > now_us) {
+            uint64_t remaining_us = deadline_us - now_us;
+            /* Cap at 60s to avoid pathological waits if the deadline is huge */
+            if (remaining_us > 60ULL * 1000 * 1000) remaining_us = 60ULL * 1000 * 1000;
+            struct timespec ts = {
+                .tv_sec  = (time_t)(remaining_us / 1000000ULL),
+                .tv_nsec = (long)((remaining_us % 1000000ULL) * 1000ULL),
+            };
+            /* Loop in case nanosleep is interrupted by a signal */
+            while (nanosleep(&ts, &ts) == -1 && errno == EINTR) { /* retry */ }
+        }
+
         /* Write a successful clock event so the guest sees poll_oneoff succeed */
         wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
         uint8_t *evt = (uint8_t *)wasm_runtime_addr_app_to_native(
