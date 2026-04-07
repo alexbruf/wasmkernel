@@ -185,6 +185,26 @@ describe("Phase 4: hardening (WAMR wasi-threads test suite)", () => {
     const s = parseStatus(result.stderr);
     expect(s?.status).toBe(1);
   });
+
+  /* Sanity test for kernel_call_indirect: load a guest, call its exported
+   * function via the indirect function table. The full asyncify suspend/
+   * resume path is tested end-to-end by the emnapi tsfn suite (which calls
+   * thousands of guest callbacks via napi → kernel_call_indirect with
+   * cooperative threads sleeping/waiting on the bridge).
+   */
+  test("kernel_call_indirect basic invocation", async () => {
+    const proc = Bun.spawn(
+      ["node", "--experimental-wasi-unstable-preview1",
+       join(ROOT, "tests", "host", "run_asyncify_indirect.mjs")],
+      { stdout: "pipe", stderr: "pipe" }
+    );
+    const stdout = await new Response(proc.stdout).text();
+    const stderr = await new Response(proc.stderr).text();
+    const exitCode = await proc.exited;
+    if (exitCode !== 0) console.error("STDERR:", stderr);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("tier1 (simple_add) PASS");
+  }, 30000);
 });
 
 /**

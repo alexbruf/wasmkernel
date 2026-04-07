@@ -44,6 +44,20 @@ for src in tests/guest/thread_raw.c tests/guest/mutex_counter.c \
     echo "  $(basename "$out")"
 done
 
+# Reactor-mode guest with indirect function table for kernel_call_indirect test
+if [ -f tests/guest/asyncify_indirect.c ]; then
+    "$CC" --target=wasm32-wasi-threads -O2 \
+        -matomics -mbulk-memory -mexec-model=reactor \
+        -Wl,--shared-memory,--import-memory,--export-memory,--max-memory=1048576 \
+        -Wl,--export=get_simple_add_idx \
+        -Wl,--export=get_yield_loop_idx \
+        -Wl,--export=get_called_count \
+        -Wl,--export=__indirect_function_table \
+        tests/guest/asyncify_indirect.c \
+        -o tests/guest/asyncify_indirect.wasm
+    echo "  asyncify_indirect.wasm"
+fi
+
 echo ""
 echo "=== Compiling WAMR wasi-threads test suite ==="
 WAMR_TEST_DIR="deps/wamr/core/iwasm/libraries/lib-wasi-threads/test"
