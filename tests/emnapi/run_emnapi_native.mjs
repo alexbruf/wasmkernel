@@ -50,7 +50,20 @@ const testFileMap = {
   'object_exception': 'object/object_exceptions.test.js',
   'reference_all_types': 'ref_by_node_api_version/ref_by_node_api_version.test.js',
   'reference_obj_only': 'ref_by_node_api_version/ref_by_node_api_version.test.js',
+  // Sub-tests within existing test directories — these reuse the parent
+  // wasm but exercise different APIs/edge cases.
+  'async_hooks': 'async/async_hooks.test.js',           // wasm: async
+  'async_context_gcable': 'async_context/gcable.test.js', // wasm: async_context
+  'async_context_gcable_cb': 'async_context/gcable-callback.test.js', // wasm: async_context
+  'general_global': 'general/global.test.js',           // wasm: general
+  'general_status': 'general/status.test.js',           // wasm: general
+  'number_null': 'number/number-null.test.js',          // wasm: number
+  'wrap_double_free': 'ref_double_free/wrap.test.js',   // wasm: ref_double_free
 };
+
+// Sub-tests don't have their own wasm — they use whatever the test file
+// requests via load(). util.js handles that lookup, so we don't need
+// extra mapping here.
 
 const testFiles = Object.hasOwn(testFileMap, testName)
   ? [testFileMap[testName]]

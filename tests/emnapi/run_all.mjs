@@ -1,112 +1,58 @@
 #!/usr/bin/env node
 /**
- * Run ALL emnapi tests in a single process.
- * Loads the kernel once, then loads each guest wasm sequentially.
- * Output: JSON with pass/fail per test.
+ * Run multiple emnapi tests sequentially as subprocesses, each via the
+ * real test runner (run_emnapi_native.mjs). Outputs JSON pass/fail per test.
+ *
+ * Usage: node run_all.mjs <test1> <test2> ...
  */
-import { readFileSync, readdirSync } from "fs";
-import { WASI } from "wasi";
-import { NapiRuntime } from "../host/napi_runtime.mjs";
+import { spawnSync } from "child_process";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 
-const kernelBytes = readFileSync(new URL("../../build/wasmkernel.wasm", import.meta.url).pathname);
-const wasmDir = new URL("./wasm/", import.meta.url).pathname;
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const RUNNER = join(__dirname, "run_emnapi_native.mjs");
+
 const tests = process.argv.slice(2);
-
 if (tests.length === 0) {
-  // Run all .wasm files
-  tests.push(...readdirSync(wasmDir).filter(f => f.endsWith(".wasm")).map(f => f.replace(".wasm", "")));
+  console.error("Usage: run_all.mjs <test1> <test2> ...");
+  process.exit(2);
 }
 
-const results = {};
-
-for (const testName of tests) {
+// typedarray needs Float16Array (Node v24+). If running on older Node,
+// look for a v24 install via nvm and use that for typedarray.
+const NODE_MAJOR = parseInt(process.versions.node.split(".")[0], 10);
+let NODE24_PATH = null;
+if (NODE_MAJOR < 24) {
   try {
-    const guestBytes = readFileSync(`${wasmDir}${testName}.wasm`);
-    const wasi = new WASI({ version: "preview1", args: [], env: {} });
-    const pendingIO = new Map();
-    const bridgeFunctions = new Map();
-    let k;
-
-    const hostImports = {
-      host_func_call(funcIdx, argsPtr, argc) {
-        const handler = bridgeFunctions.get(funcIdx);
-        if (!handler) return 0n;
-        const args = [];
-        for (let i = 0; i < argc; i++)
-          args.push(new DataView(k.memory.buffer).getUint32(argsPtr + i * 8, true));
-        try { return handler(args, argsPtr); }
-        catch { return 0n; }
-      },
-      host_io_submit(cb) { pendingIO.set(cb, { bytes: 0, error: 0 }); },
-      host_io_check(cb) { return pendingIO.has(cb) ? 1 : 0; },
-      host_io_result_bytes(cb) { return pendingIO.get(cb)?.bytes ?? 0; },
-      host_io_result_error(cb) { const r = pendingIO.get(cb); if (r) pendingIO.delete(cb); return r?.error ?? 8; },
-    };
-
-    // Each test gets its own kernel instance (clean state)
-    const compiled = await WebAssembly.compile(kernelBytes);
-    const instance = await WebAssembly.instantiate(compiled, {
-      wasi_snapshot_preview1: wasi.wasiImport, host: hostImports,
-    });
-    wasi.initialize(instance);
-    k = instance.exports;
-    k.kernel_init();
-
-    const ptr = k.kernel_alloc(guestBytes.length);
-    new Uint8Array(k.memory.buffer, ptr, guestBytes.length).set(guestBytes);
-    if (k.kernel_load(ptr, guestBytes.length) !== 0) {
-      results[testName] = "load_failed";
-      continue;
-    }
-
-    const napiRuntime = new NapiRuntime(k);
-    const bridgeCount = k.kernel_bridge_count();
-    const infoBuf = k.kernel_alloc(256);
-    for (let i = 0; i < bridgeCount; i++) {
-      const len = k.kernel_bridge_info(i, infoBuf, 256);
-      if (!len) continue;
-      const bytes = new Uint8Array(k.memory.buffer, infoBuf, len);
-      const parts = []; let start = 0;
-      for (let j = 0; j < len; j++) { if (bytes[j] === 0) { parts.push(new TextDecoder().decode(bytes.slice(start, j))); start = j + 1; } }
-      const [mod, field] = parts;
-      if ((mod === "env" || mod === "emnapi" || mod === "napi") && napiRuntime[field]) {
-        const fn = field;
-        bridgeFunctions.set(i, (args, argsPtr) => napiRuntime.dispatch(fn, args, argsPtr));
-      } else {
-        bridgeFunctions.set(i, () => 0n);
+    const fs = await import("fs");
+    const home = process.env.HOME;
+    if (home && fs.existsSync(`${home}/.nvm/versions/node`)) {
+      const versions = fs.readdirSync(`${home}/.nvm/versions/node`)
+        .filter(v => v.startsWith("v24."))
+        .sort()
+        .reverse();
+      if (versions.length > 0) {
+        NODE24_PATH = `${home}/.nvm/versions/node/${versions[0]}/bin/node`;
       }
     }
-
-    let status = 0;
-    while (status === 0) status = k.kernel_step();
-
-    const exportsObj = {};
-    const eh = napiRuntime._newHandle(exportsObj);
-    const np = k.kernel_alloc(22);
-    new Uint8Array(k.memory.buffer, np, 21).set(new TextEncoder().encode("napi_register_wasm_v1"));
-    new Uint8Array(k.memory.buffer)[np + 21] = 0;
-    const ap = k.kernel_alloc(8);
-    new DataView(k.memory.buffer).setUint32(ap, 1, true);
-    new DataView(k.memory.buffer).setUint32(ap + 4, eh, true);
-    const callResult = k.kernel_call(np, ap, 2);
-
-    if (callResult !== 0) {
-      results[testName] = "register_failed";
-      continue;
-    }
-
-    // Check exports exist
-    const keys = Object.getOwnPropertyNames(
-      napiRuntime._getHandle(new DataView(k.memory.buffer).getUint32(ap, true)) ?? exportsObj
-    );
-
-    results[testName] = "pass";
-  } catch (e) {
-    results[testName] = `error: ${e?.message?.slice(0, 60) ?? e}`;
-  }
+  } catch {}
 }
 
-// Output results
+const TESTS_NEEDING_NODE24 = new Set(["typedarray"]);
+
+const results = {};
+for (const testName of tests) {
+  const nodeBin = (NODE24_PATH && TESTS_NEEDING_NODE24.has(testName))
+    ? NODE24_PATH : process.execPath;
+  const r = spawnSync(
+    nodeBin,
+    ["--expose-gc", "--experimental-wasi-unstable-preview1", RUNNER, testName],
+    { encoding: "utf8", timeout: 60000 }
+  );
+  const passed = r.stdout.includes("PASS " + testName) || r.stdout.includes("PASS\n");
+  results[testName] = passed ? "pass" : `fail (exit=${r.status})`;
+}
+
 const passed = Object.values(results).filter(r => r === "pass").length;
 const failed = Object.values(results).filter(r => r !== "pass").length;
 for (const [name, result] of Object.entries(results)) {
