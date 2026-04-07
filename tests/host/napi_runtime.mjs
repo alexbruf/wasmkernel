@@ -2565,6 +2565,16 @@ export class NapiRuntime {
     return false;
   }
 
+  /* Returns true if any TSFN is still ref'd (i.e. should keep the event
+     loop alive). Used to decide whether the stepper should remain ref'd. */
+  hasRefedTsfn() {
+    for (const [, val] of this.handles) {
+      if (val?.type !== 'threadsafe_function') continue;
+      if (val.refed && !val._finalized) return true;
+    }
+    return false;
+  }
+
   napi_release_threadsafe_function(args) {
     // No env: (tsfn, mode) where mode: 0=release, 1=abort
     const [tsfnHandle, mode] = args;

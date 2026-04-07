@@ -90,7 +90,9 @@ set_target_properties(wasmkernel PROPERTIES
     SUFFIX ".wasm"
 )
 
-# Apply asyncify transform for cooperative thread yield/resume
+# Apply asyncify transform: only required for blocking host calls (sched_yield,
+# wait32 inside kernel_call_indirect) where the C stack needs to suspend
+# mid-execution. Pure fuel-exhaustion uses the YIELD flag mechanism.
 find_program(WASM_OPT wasm-opt)
 if(WASM_OPT)
     add_custom_command(TARGET wasmkernel POST_BUILD

@@ -64,6 +64,10 @@ wasmkernel_get_asyncify_buf(wasm_exec_env_t exec_env)
             uint32_t *header = (uint32_t *)buf;
             header[0] = (uint32_t)(uintptr_t)(buf + 8);
             header[1] = (uint32_t)(uintptr_t)(buf + 4096);
+            /* Mark that this thread is unwinding via asyncify so the scheduler
+               knows to use asyncify_start_rewind on resume (rather than the
+               YIELD flag fast path). */
+            g_scheduler.threads[i].asyncify_unwound = true;
             return buf;
         }
     }
@@ -344,9 +348,11 @@ wasmkernel_scheduler_step(void)
         thread->exec_env->_spin_yield_enabled = (thread->start_routine != NULL);
     }
 
-    /* Clear yield flag before running */
-    WASM_SUSPEND_FLAGS_FETCH_AND(thread->exec_env->suspend_flags,
-                                 ~WASM_SUSPEND_FLAG_YIELD);
+    /* Note: do NOT clear the YIELD flag here. If set, it signals to the
+       wasm interpreter that this is a resume from a previous yield, and
+       it should continue from the saved frame instead of starting fresh.
+       The YIELD path inside wasm_interp_call_wasm/wasm_interp_call_func_bytecode
+       clears the flag itself once the saved state has been restored. */
 
     /* Asyncify functions (added by wasm-opt --asyncify post-build) */
     extern void asyncify_stop_unwind(void);
@@ -393,28 +399,38 @@ wasmkernel_scheduler_step(void)
             asyncify_stop_unwind();
         }
     } else if (thread->start_routine) {
-        /* Resume spawned thread via asyncify rewind.
-           This re-enters the same function call chain, restoring all
-           C stack frames that were saved during unwind. */
         wasm_module_inst_t inst = wasm_runtime_get_module_inst(
             thread->exec_env);
-
-        asyncify_start_rewind(thread->asyncify_buf);
-
         wasm_function_inst_t wasi_start =
             wasm_runtime_lookup_function(inst, "wasi_thread_start");
         void *targ = thread->exec_env->thread_arg;
-        if (wasi_start && targ) {
-            uint32_t arg = *(uint32_t *)((char *)targ + 4);
-            int32_t tid = *(int32_t *)((char *)targ + 8);
-            uint32_t argv[2] = { (uint32_t)tid, arg };
-            wasm_runtime_call_wasm(thread->exec_env, wasi_start, 2, argv);
-        }
 
-        if (asyncify_get_state() == 1)
-            asyncify_stop_unwind();
-        else if (asyncify_get_state() == 2)
-            asyncify_stop_rewind();
+        if (thread->asyncify_unwound) {
+            /* Resume via asyncify rewind: a host call (sched_yield, wait32
+               from inside kernel_call_indirect) suspended mid-execution. */
+            thread->asyncify_unwound = false;
+            asyncify_start_rewind(thread->asyncify_buf);
+            if (wasi_start && targ) {
+                uint32_t arg = *(uint32_t *)((char *)targ + 4);
+                int32_t tid = *(int32_t *)((char *)targ + 8);
+                uint32_t argv[2] = { (uint32_t)tid, arg };
+                wasm_runtime_call_wasm(thread->exec_env, wasi_start, 2, argv);
+            }
+            if (asyncify_get_state() == 1)
+                asyncify_stop_unwind();
+            else if (asyncify_get_state() == 2)
+                asyncify_stop_rewind();
+        } else {
+            /* Resume via YIELD flag: pure wasm interpreter pause (fuel
+               exhaustion or wait32). The wasm_interp_call_wasm YIELD path
+               picks up the preserved frame from the exec_env. */
+            if (wasi_start && targ) {
+                uint32_t arg = *(uint32_t *)((char *)targ + 4);
+                int32_t tid = *(int32_t *)((char *)targ + 8);
+                uint32_t argv[2] = { (uint32_t)tid, arg };
+                wasm_runtime_call_wasm(thread->exec_env, wasi_start, 2, argv);
+            }
+        }
     } else {
         /* Resume main thread via old YIELD mechanism */
         WASM_SUSPEND_FLAGS_FETCH_OR(thread->exec_env->suspend_flags,

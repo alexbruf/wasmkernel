@@ -18,13 +18,18 @@ CC="$WASI_SDK/bin/clang"
 echo ""
 echo "=== Compiling single-threaded guest tests ==="
 for src in tests/guest/hello.c tests/guest/exit42.c tests/guest/trap.c \
-           tests/guest/alloc.c tests/guest/args.c tests/guest/poll_sleep.c \
-           tests/guest/stack_overflow.c; do
+           tests/guest/alloc.c tests/guest/args.c tests/guest/poll_sleep.c; do
     [ -f "$src" ] || continue
     out="${src%.c}.wasm"
     "$CC" --target=wasm32-wasi -O2 "$src" -o "$out"
     echo "  $(basename "$out")"
 done
+
+# stack_overflow needs -O0 so clang doesn't optimize the recursion into a loop
+if [ -f tests/guest/stack_overflow.c ]; then
+    "$CC" --target=wasm32-wasi -O0 tests/guest/stack_overflow.c -o tests/guest/stack_overflow.wasm
+    echo "  stack_overflow.wasm (-O0)"
+fi
 
 echo ""
 echo "=== Compiling threaded guest tests ==="

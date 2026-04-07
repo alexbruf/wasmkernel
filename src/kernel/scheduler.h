@@ -50,8 +50,12 @@ typedef struct WasmKernelThread {
     void *(*start_routine)(void *);
     void *start_arg;
 
-    /* Asyncify data buffer for yield/resume (cooperative scheduling) */
+    /* Asyncify data buffer for yield/resume.
+       Only used when a blocking host call (sched_yield, wait32 from inside
+       kernel_call_indirect) needs to suspend mid-execution. Pure fuel
+       exhaustion uses the YIELD flag mechanism without asyncify. */
     uint8_t asyncify_buf[4096];
+    bool asyncify_unwound; /* true if last yield used asyncify_start_unwind */
 
     /* For async I/O (THREAD_BLOCKED_IO) */
     uint32_t io_callback_id;

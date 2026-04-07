@@ -137,18 +137,20 @@ exports.load = async function (targetName, options = {}) {
   // Start background stepper for cooperative threads
   result._kernel = k
   result._napiRuntime = napiRuntime
+  // Helper: is there any work that should keep the event loop alive?
+  // Async work always counts. TSFN work only counts if any TSFN is still ref'd.
+  const hasRefedWork = () => {
+    if (napiRuntime._pendingAsyncQueue.length > 0) return true
+    return napiRuntime.hasRefedTsfn()
+  }
+
   const stepper = setInterval(() => {
     const threadCount = k.kernel_thread_count()
 
     if (threadCount <= 0) {
       napiRuntime.drainTsfnQueue()
       napiRuntime.drainAsyncQueue()
-      // Unref when no more work to do
-      if (napiRuntime._pendingAsyncQueue.length === 0
-          && !napiRuntime.hasPendingTsfn()
-          && stepper.unref) {
-        stepper.unref()
-      }
+      if (!hasRefedWork() && stepper.unref) stepper.unref()
       return
     }
     // Run a batch of steps to give threads time
@@ -162,12 +164,9 @@ exports.load = async function (targetName, options = {}) {
     if (napiRuntime._pendingAsyncQueue.length > 0) {
       napiRuntime.drainAsyncQueue()
     }
-    // Unref when no more work
-    if (napiRuntime._pendingAsyncQueue.length === 0
-        && threadCount <= 0
-        && stepper.unref) {
-      stepper.unref()
-    }
+    // Unref the stepper when no ref'd work remains, even if cooperative
+    // threads are still running (matches Node's behavior with unref'd TSFNs).
+    if (!hasRefedWork() && stepper.unref) stepper.unref()
   }, 1)
   // Don't let the stepper keep the process alive when idle
   if (stepper.unref) stepper.unref()
@@ -180,11 +179,16 @@ exports.load = async function (targetName, options = {}) {
     return r
   }
 
-  // Hook into napi_call_threadsafe_function to ref stepper for TSFN drain
+  // Hook into napi_call_threadsafe_function to ref stepper for TSFN drain.
+  // Only ref if the TSFN is ref'd — unref'd TSFNs should NOT keep the event
+  // loop alive, matching Node.js semantics. Without this, a tight loop of
+  // calls from an unref'd TSFN (e.g. tsfn_shutdown's 32 worker threads) would
+  // prevent the process from ever exiting.
   const origCallTsfn = napiRuntime.napi_call_threadsafe_function.bind(napiRuntime)
   napiRuntime.napi_call_threadsafe_function = function(args) {
     const r = origCallTsfn(args)
-    if (stepper.ref) stepper.ref()
+    const tsf = napiRuntime._getHandle(args[0])
+    if (tsf?.refed && stepper.ref) stepper.ref()
     return r
   }
 
