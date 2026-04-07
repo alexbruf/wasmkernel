@@ -275,6 +275,14 @@ export class NapiRuntime {
     const [env, strPtr, len, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
     if (len > 0x7FFFFFFF && len !== 0xFFFFFFFF) return napi_invalid_arg; // > INT_MAX
+    // NULL string with non-zero length (including NAPI_AUTO_LENGTH) is invalid.
+    // NULL with length 0 is valid (produces empty string).
+    if (!strPtr) {
+      if (len !== 0) return napi_invalid_arg;
+      const h = this._newHandle("");
+      this._writeResult(resultPtr, h);
+      return napi_ok;
+    }
     let str;
     if (len === 0xFFFFFFFF || len === -1) {
       str = this._readNullTermString(strPtr);
@@ -315,7 +323,9 @@ export class NapiRuntime {
     const obj = this._getHandle(objectHandle);
     const val = this._getHandle(valueHandle);
     const name = this._readNullTermString(namePtr);
-    if (obj && typeof obj === 'object') obj[name] = val;
+    if (obj != null && (typeof obj === 'object' || typeof obj === 'function')) {
+      obj[name] = val;
+    }
     return napi_ok;
   }
 
@@ -347,7 +357,9 @@ export class NapiRuntime {
     const obj = this._getHandle(objectHandle);
     const key = this._getHandle(keyHandle);
     const val = this._getHandle(valueHandle);
-    if (obj && typeof obj === 'object') obj[key] = val;
+    if (obj != null && (typeof obj === 'object' || typeof obj === 'function')) {
+      obj[key] = val;
+    }
     return napi_ok;
   }
 
@@ -777,9 +789,13 @@ export class NapiRuntime {
 
   napi_unwrap(args) {
     const [env, objectHandle, resultPtr] = args;
+    if (!objectHandle || !resultPtr) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
-    const ptr = (obj != null && (typeof obj === 'object' || typeof obj === 'function')) ? (this.wraps.get(obj) ?? 0) : 0;
-    this._writeU32(resultPtr, ptr);
+    if (obj == null || (typeof obj !== 'object' && typeof obj !== 'function')) {
+      return napi_invalid_arg;
+    }
+    if (!this.wraps.has(obj)) return napi_invalid_arg;
+    this._writeU32(resultPtr, this.wraps.get(obj));
     return napi_ok;
   }
 
@@ -1014,8 +1030,8 @@ export class NapiRuntime {
     if (!objectHandle || !namePtr || !resultPtr) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     const name = this._readNullTermString(namePtr);
-    const has = obj && typeof obj === 'object' && name in obj;
-    this._writeBool(resultPtr, has);
+    const isObj = obj != null && (typeof obj === 'object' || typeof obj === 'function');
+    this._writeBool(resultPtr, isObj && name in obj);
     return napi_ok;
   }
 
@@ -1025,8 +1041,8 @@ export class NapiRuntime {
     if (!objectHandle || !keyHandle || !resultPtr) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     const key = this._getHandle(keyHandle);
-    const has = obj && typeof obj === 'object' && key in obj;
-    this._writeBool(resultPtr, has);
+    const isObj = obj != null && (typeof obj === 'object' || typeof obj === 'function');
+    this._writeBool(resultPtr, isObj && key in obj);
     return napi_ok;
   }
 
@@ -1062,11 +1078,16 @@ export class NapiRuntime {
     const [env, strPtr, len, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
     if (len > 0x7FFFFFFF && len !== 0xFFFFFFFF) return napi_invalid_arg;
+    if (!strPtr) {
+      if (len !== 0) return napi_invalid_arg;
+      const h = this._newHandle("");
+      this._writeResult(resultPtr, h);
+      return napi_ok;
+    }
     const base = this._guestBase();
     const mem = new Uint8Array(this._buf());
     let str;
     if (len === 0xFFFFFFFF || len === -1) {
-      // null-terminated
       let end = strPtr;
       while (mem[base + end] !== 0) end++;
       str = Array.from(mem.subarray(base + strPtr, base + end), b => String.fromCharCode(b)).join('');
@@ -1681,11 +1702,16 @@ export class NapiRuntime {
     const [env, strPtr, len, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
     if (len > 0x7FFFFFFF && len !== 0xFFFFFFFF) return napi_invalid_arg;
+    if (!strPtr) {
+      if (len !== 0) return napi_invalid_arg;
+      const h = this._newHandle("");
+      this._writeResult(resultPtr, h);
+      return napi_ok;
+    }
     const base = this._guestBase();
     const actualLen = len === 0xFFFFFFFF ? -1 : len;
     let str = '';
     if (actualLen === -1) {
-      // null-terminated UTF-16
       let i = 0;
       while (true) {
         const ch = new DataView(this._buf()).getUint16(base + strPtr + i * 2, true);
@@ -2016,7 +2042,7 @@ export class NapiRuntime {
   // napi_has_own_property(env, object, key, result)
   napi_has_own_property(args) {
     const [env, objectHandle, keyHandle, resultPtr] = args;
-    if (!objectHandle || !resultPtr) return napi_invalid_arg;
+    if (!objectHandle || !keyHandle || !resultPtr) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
     const key = this._getHandle(keyHandle);
     if (typeof key !== 'string' && typeof key !== 'symbol') return napi_name_expected;
@@ -2219,10 +2245,14 @@ export class NapiRuntime {
   // napi_remove_wrap(env, object, result)
   napi_remove_wrap(args) {
     const [env, objectHandle, resultPtr] = args;
+    if (!objectHandle) return napi_invalid_arg;
     const obj = this._getHandle(objectHandle);
-    const isObj = obj != null && (typeof obj === 'object' || typeof obj === 'function');
-    const ptr = isObj ? (this.wraps.get(obj) ?? 0) : 0;
-    if (isObj) this.wraps.delete(obj);
+    if (obj == null || (typeof obj !== 'object' && typeof obj !== 'function')) {
+      return napi_invalid_arg;
+    }
+    if (!this.wraps.has(obj)) return napi_invalid_arg;
+    const ptr = this.wraps.get(obj);
+    this.wraps.delete(obj);
     if (resultPtr) this._writeU32(resultPtr, ptr);
     return napi_ok;
   }

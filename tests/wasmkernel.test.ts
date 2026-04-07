@@ -249,7 +249,7 @@ describe("Phase 5: Oxide integration", () => {
 });
 
 describe("Phase 5: emnapi Node-API compliance suite", () => {
-  test("emnapi compliance suite (66 tests)", () => {
+  test("emnapi compliance suite (70 tests)", () => {
     const tests = [
       // 59 main tests
       "hello", "arg", "callback", "objfac", "fnfac", "function",
@@ -266,15 +266,16 @@ describe("Phase 5: emnapi Node-API compliance suite", () => {
       "passwrap", "tsfn_abort",
       "tsfn", "pool", "uv_threadpool_size", "trap_in_thread",
       "async_cleanup_hook", "typedarray", "tsfn_shutdown", "string_mt",
-      // 7 sub-tests within existing test directories — same wasm,
+      // 11 sub-tests within existing test directories — same wasm,
       // different test JS exercising different APIs/edge cases
       "async_hooks", "async_context_gcable", "async_context_gcable_cb",
       "general_global", "general_status", "number_null", "wrap_double_free",
+      "constructor_null", "string_null", "object_null", "general_finalizer",
     ];
     const result = runNodeTest(`tests/emnapi/run_all.mjs ${tests.join(" ")}`);
     expect(result.exitCode).toBe(0);
     const json = JSON.parse(result.stdout.trim().split("\n").pop()!);
     expect(json.failed).toBe(0);
     expect(json.passed).toBe(tests.length);
-  }, 900000); // 15 minutes — real sleep() makes several tests take 5-10s each
+  }, 180000); // 3 min — tests run in parallel via run_all.mjs
 });

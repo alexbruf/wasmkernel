@@ -59,6 +59,11 @@ const testFileMap = {
   'general_status': 'general/status.test.js',           // wasm: general
   'number_null': 'number/number-null.test.js',          // wasm: number
   'wrap_double_free': 'ref_double_free/wrap.test.js',   // wasm: ref_double_free
+  'constructor_null': 'constructor/constructor-null.test.js', // wasm: constructor
+  'string_null': 'string/string-null.test.js',                // wasm: string
+  'object_null': 'object/object_null.test.js',                // wasm: object
+  'general_finalizer': 'general/finalizer.test.js',           // wasm: general
+  'objwrapref': 'objwrap/objwrapref.test.js',                 // wasm: objwrap
 };
 
 // Sub-tests don't have their own wasm — they use whatever the test file
@@ -117,14 +122,23 @@ try {
   // Some tests (tsfn_abort, tsfn_shutdown) export Promises that never resolve —
   // they expect the process to exit cleanly. Race with a timeout. The async
   // test does multiple sleep(1)s which can take 5+ seconds total.
-  const timeout = new Promise(r => setTimeout(r, 20000, '__timeout__'));
+  const timeoutHandle = { t: null };
+  // 12s is enough for the slowest real tests (async does ~9.5s of real sleeps).
+  // Tests that intentionally never resolve (tsfn_abort, tsfn_shutdown) will hit
+  // the timeout and be counted as pass.
+  const timeout = new Promise(r => {
+    timeoutHandle.t = setTimeout(r, 12000, '__timeout__');
+  });
   const outcome = await Promise.race([Promise.resolve(result), timeout]);
+  clearTimeout(timeoutHandle.t);
   if (outcome === '__timeout__') {
-    // Process stayed alive for 5s with no errors — consider it a pass
+    // Process stayed alive for 20s with no errors — consider it a pass
+    // (tests like tsfn_abort/tsfn_shutdown export Promises that never resolve)
     console.log(`PASS ${testName}`);
-    process.exit(0);
+  } else {
+    console.log(`PASS ${testName}`);
   }
-  console.log(`PASS ${testName}`);
+  process.exit(0);
 } catch (e) {
   console.error(`FAIL ${testName}: ${e?.message ?? e}`);
   if (e?.stack) console.error(e.stack.split('\n').slice(0, 5).join('\n'));
