@@ -4,5 +4,15 @@ build/
 .claude/
 node_modules/
 *.wasm
+*.tgz
 .playwright-mcp/
+dist/
+.wrangler/
+
+# Tracked test fixtures (published binaries we test against)
+!tests/pkgs/**/*.wasm
+!tests/emnapi/wasm/*.wasm
+
+# Tracked guest C sources (the compiled .wasm output stays ignored —
+# CI rebuilds them via scripts/build-guests.sh)
 !tests/guest/*.c
