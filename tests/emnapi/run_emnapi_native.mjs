@@ -64,6 +64,12 @@ const testFileMap = {
   'object_null': 'object/object_null.test.js',                // wasm: object
   'general_finalizer': 'general/finalizer.test.js',           // wasm: general
   'objwrapref': 'objwrap/objwrapref.test.js',                 // wasm: objwrap
+  'general_run': 'general/run.test.js',                       // wasm: general
+  'exception_finalizer': 'exception/exception.finalizer.test.js', // wasm: exception
+  'finalizer_fatal': 'finalizer/finalizer_fatal.test.js',     // wasm: finalizer
+  'make_callback_hooks': 'make_callback/make_callback_hooks.test.js', // wasm: make_callback
+  'async_st': 'async/async_st.test.js',                       // wasm: async (single-threaded variant)
+  'tsfn2_st': 'tsfn2/tsfn2_st.test.js',                       // wasm: tsfn2 (single-threaded variant)
 };
 
 // Sub-tests don't have their own wasm — they use whatever the test file

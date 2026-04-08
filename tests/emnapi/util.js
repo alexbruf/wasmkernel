@@ -116,6 +116,18 @@ exports.load = async function (targetName, options = {}) {
   const exportsObj = {}
   const exportsHandle = napiRuntime._newHandle(exportsObj)
 
+  // Set _kernel/_napiRuntime on exportsObj BEFORE Init runs, so that
+  // anything the guest attaches to exports (e.g. an error's .binding)
+  // still exposes the runtime. This matters for tests like
+  // exception/exception.finalizer where Init throws but later code
+  // calls through the thrown error's .binding.
+  exportsObj._kernel = k
+  exportsObj._napiRuntime = napiRuntime
+
+  // Run cleanup hooks at process exit. Registered before Init so
+  // finalizers triggered by failed-Init exception paths still drain.
+  process.on('exit', () => { napiRuntime.runCleanupHooks() })
+
   const np = k.kernel_alloc(23)
   const nameBytes = new TextEncoder().encode('napi_register_wasm_v1')
   new Uint8Array(k.memory.buffer, np, 22).set(nameBytes)
@@ -124,19 +136,27 @@ exports.load = async function (targetName, options = {}) {
   new DataView(k.memory.buffer).setUint32(ap, 1, true)
   new DataView(k.memory.buffer).setUint32(ap + 4, exportsHandle, true)
   const callResult = k.kernel_call(np, ap, 2)
-  if (callResult !== 0) {
+  // If the guest's Init threw a JS exception (via napi_throw), propagate
+  // the actual exception object (may have attached properties like .binding).
+  // napi_throw sets exceptionPending but returns ok, so the call result may
+  // still be 0 even when there's a pending exception.
+  let pendingInitException = null
+  if (napiRuntime.exceptionPending && napiRuntime.lastException) {
+    pendingInitException = napiRuntime.lastException
+    napiRuntime.exceptionPending = false
+    napiRuntime.lastException = null
+  }
+  if (!pendingInitException && callResult !== 0) {
     throw new Error(`napi_register_wasm_v1 failed: ${callResult}`)
   }
 
   const retHandle = new DataView(k.memory.buffer).getUint32(ap, true)
   const result = napiRuntime._getHandle(retHandle) ?? exportsObj
-
-  // Run cleanup hooks at process exit
-  process.on('exit', () => { napiRuntime.runCleanupHooks() })
-
-  // Start background stepper for cooperative threads
-  result._kernel = k
-  result._napiRuntime = napiRuntime
+  // Ensure result also has _kernel/_napiRuntime (may differ from exportsObj)
+  if (result !== exportsObj) {
+    result._kernel = k
+    result._napiRuntime = napiRuntime
+  }
   // Helper: is there any work that should keep the event loop alive?
   // Async work always counts. TSFN work only counts if any TSFN is still ref'd.
   const hasRefedWork = () => {
@@ -191,6 +211,10 @@ exports.load = async function (targetName, options = {}) {
     if (tsf?.refed && stepper.ref) stepper.ref()
     return r
   }
+
+  // If Init threw, propagate the exception now that the stepper is running
+  // (so GC finalizers in the catch path can still be drained).
+  if (pendingInitException) throw pendingInitException
 
   return result
 }

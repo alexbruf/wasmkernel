@@ -133,6 +133,12 @@ const k = instance.exports;
 
 k.kernel_init();
 
+// Optional max-threads override (for tests that expect a specific limit).
+const maxThreads = parseInt(process.env.WASMKERNEL_MAX_THREADS || "0", 10);
+if (maxThreads > 0 && k.kernel_set_max_threads) {
+  k.kernel_set_max_threads(maxThreads);
+}
+
 const ptr = k.kernel_alloc(guestBytes.length);
 const mem = new Uint8Array(k.memory.buffer);
 mem.set(guestBytes, ptr);

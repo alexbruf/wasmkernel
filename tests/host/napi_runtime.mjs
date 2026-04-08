@@ -252,6 +252,13 @@ export class NapiRuntime {
   napi_create_object(args) {
     const [env, resultPtr] = args;
     if (!resultPtr) return napi_invalid_arg;
+    // Finalizers run in a "basic env" where GC-affecting operations like
+    // napi_create_object are forbidden. Match Node's fatal-error behavior.
+    if (this._drainingFinalizers) {
+      process.stderr.write(
+        "FATAL ERROR: Finalizer is calling a function that may affect GC state\n");
+      process.exit(1);
+    }
     const h = this._newHandle({});
     this._writeResult(resultPtr, h);
     return napi_ok;
@@ -767,6 +774,11 @@ export class NapiRuntime {
       if (this.wraps.has(obj)) return napi_invalid_arg; // already wrapped
       this.wraps.set(obj, nativePtr);
       const token = this._registerFinalizer(obj, finalizeCb, nativePtr, finalizeHint);
+      // Track wrap → {token, refIds} so napi_remove_wrap can cancel the
+      // finalizer and invalidate any dangling napi_refs created here.
+      if (!this._wrapInfo) this._wrapInfo = new WeakMap();
+      const info = { token, refIds: [] };
+      this._wrapInfo.set(obj, info);
       if (resultPtr && token) {
         // Store token so napi_delete_reference can cancel the finalizer
         if (!this._refTokens) this._refTokens = new Map();
@@ -774,6 +786,7 @@ export class NapiRuntime {
         const refPtr = this._allocRefPtr(refId);
         this.refs.set(refId, { handle: objectHandle, refcount: 0, ptr: refPtr });
         this._refTokens.set(refId, token);
+        info.refIds.push(refId);
         this._writeU32(resultPtr, refPtr);
         return napi_ok;
       }
@@ -2253,6 +2266,20 @@ export class NapiRuntime {
     if (!this.wraps.has(obj)) return napi_invalid_arg;
     const ptr = this.wraps.get(obj);
     this.wraps.delete(obj);
+    // Per N-API: removing a wrap must NOT invoke its finalizer, and any
+    // dangling napi_ref created by napi_wrap is invalidated.
+    const info = this._wrapInfo?.get(obj);
+    if (info) {
+      if (info.token) {
+        info.token.cancelled = true;
+        this._postedFinalizersRegistry?.unregister(info.token);
+      }
+      for (const rid of info.refIds) {
+        const ref = this.refs.get(rid);
+        if (ref) ref.released = true;
+      }
+      this._wrapInfo.delete(obj);
+    }
     if (resultPtr) this._writeU32(resultPtr, ptr);
     return napi_ok;
   }
@@ -2651,9 +2678,12 @@ export class NapiRuntime {
   // napi_run_script(env, script, result) — eval a JS string
   napi_run_script(args) {
     const [env, scriptHandle, resultPtr] = args;
+    if (!scriptHandle || !resultPtr) return napi_invalid_arg;
     const code = this._getHandle(scriptHandle);
+    // Script must be a string
+    if (typeof code !== 'string') return napi_string_expected;
     try {
-      const result = eval(String(code));
+      const result = eval(code);
       const h = this._newHandle(result);
       this._writeResult(resultPtr, h);
     } catch (e) {
