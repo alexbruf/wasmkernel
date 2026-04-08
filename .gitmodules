@@ -1,3 +1,4 @@
 [submodule "deps/wamr"]
 	path = deps/wamr
-	url = https://github.com/bytecodealliance/wasm-micro-runtime.git
+	url = https://github.com/alexbruf/wasm-micro-runtime.git
+	branch = wasmkernel
