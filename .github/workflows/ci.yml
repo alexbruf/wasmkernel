@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install binaryen (for wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      - name: Cache wasi-sdk
+        id: wasi-sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/wasi-sdk-25.0-x86_64-linux
+          key: wasi-sdk-25.0-x86_64-linux
+
+      - name: Install wasi-sdk
+        if: steps.wasi-sdk-cache.outputs.cache-hit != 'true'
+        run: ./scripts/install-wasi-sdk.sh
+
+      - name: Export WASI_SDK_PATH
+        run: echo "WASI_SDK_PATH=/tmp/wasi-sdk-25.0-x86_64-linux" >> "$GITHUB_ENV"
+
+      - name: Build kernel
+        run: ./scripts/build-kernel.sh
+
+      - name: Build guest tests
+        run: ./scripts/build-guests.sh
+
+      - name: Sync kernel into package
+        run: ./scripts/sync-package.sh
+
+      - name: Run tests (quick on PR, full on main)
+        env:
+          # Quick mode skips multi-minute groups (argon2, soak, emnapi
+          # compliance suite). Tag and main builds run the full suite.
+          WASMKERNEL_QUICK_TESTS: ${{ github.event_name == 'pull_request' && '1' || '' }}
+        run: bun test tests/wasmkernel.test.ts
+
+      - name: Build examples
+        run: |
+          cd examples/browser && bun install && bun run build
+          cd ../web-worker && bun install && bun run build
+          cd ../cloudflare-worker && bun install
+          cd ../node && bun install && node parse.mjs > /dev/null

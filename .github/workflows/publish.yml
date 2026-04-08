@@ -1,0 +1,77 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+      id-token: write   # required for npm provenance attestation
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install binaryen (for wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      - name: Cache wasi-sdk
+        id: wasi-sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/wasi-sdk-25.0-x86_64-linux
+          key: wasi-sdk-25.0-x86_64-linux
+
+      - name: Install wasi-sdk
+        if: steps.wasi-sdk-cache.outputs.cache-hit != 'true'
+        run: ./scripts/install-wasi-sdk.sh
+
+      - name: Export WASI_SDK_PATH
+        run: echo "WASI_SDK_PATH=/tmp/wasi-sdk-25.0-x86_64-linux" >> "$GITHUB_ENV"
+
+      - name: Build kernel
+        run: ./scripts/build-kernel.sh
+
+      - name: Build guest tests
+        run: ./scripts/build-guests.sh
+
+      - name: Sync kernel into package
+        run: ./scripts/sync-package.sh
+
+      - name: Run full test suite (gate on green)
+        run: bun test tests/wasmkernel.test.ts
+
+      - name: Verify package version matches tag
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          pkg=$(node -p "require('./packages/wasmkernel/package.json').version")
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag v$tag does not match package.json version $pkg"
+            exit 1
+          fi
+          echo "publishing version $pkg"
+
+      - name: Publish to npm
+        working-directory: packages/wasmkernel
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
