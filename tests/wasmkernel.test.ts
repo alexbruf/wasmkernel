@@ -6,7 +6,7 @@
  */
 
 import { describe, test, expect } from "bun:test";
-import { statSync } from "fs";
+import { statSync, existsSync } from "fs";
 import { join, resolve } from "path";
 
 const ROOT = resolve(import.meta.dir, "..");
@@ -19,6 +19,15 @@ const RUNNER = join(ROOT, "tests", "host", "run_wasmkernel.mjs");
 // suite (argon2, soak, emnapi compliance).
 const QUICK = process.env.WASMKERNEL_QUICK_TESTS === "1";
 const fullDescribe = QUICK ? describe.skip : describe;
+
+// Some tests depend on external fixtures set up on the dev machine
+// (emnapi test sources from a local clone, tailwind oxide from a local
+// npm install). These aren't part of the repo; when missing, skip the
+// test rather than fail. CI deliberately does not populate them.
+const HAS_EMNAPI_SRC = existsSync("/tmp/emnapi-repo/packages/test");
+const HAS_TW_OXIDE = existsSync("/tmp/tw-oxide/package/tailwindcss-oxide.wasm32-wasi.wasm");
+const describeIfEmnapi = HAS_EMNAPI_SRC ? fullDescribe : describe.skip;
+const describeIfOxide = HAS_TW_OXIDE ? describe : describe.skip;
 
 /**
  * Run a guest wasm inside wasmkernel via subprocess.
@@ -148,7 +157,7 @@ describe("Phase 4: hardening (WAMR wasi-threads test suite)", () => {
   });
 
   test("spawn 50 sequential threads (spawn_multiple_times)", async () => {
-    const result = await runGuest("wamr_spawn_multiple.wasm");
+    const result = await runGuest("wamr_spawn_multiple_times.wasm");
     const s = parseStatus(result.stderr);
     expect(s?.status).toBe(1);
   }, 30000);
@@ -256,7 +265,7 @@ describe("Phase 5: N-API compliance", () => {
   });
 });
 
-describe("Phase 5: Oxide integration", () => {
+describeIfOxide("Phase 5: Oxide integration", () => {
   test("oxide scanner produces expected CSS candidates", () => {
     const result = runNodeTest("tests/host/test_oxide.mjs");
     expect(result.exitCode).toBe(0);
@@ -334,7 +343,7 @@ fullDescribe("Phase 5: soak — no unbounded memory growth", () => {
   }, 60000);
 });
 
-fullDescribe("Phase 5: emnapi Node-API compliance suite", () => {
+describeIfEmnapi("Phase 5: emnapi Node-API compliance suite", () => {
   test("emnapi compliance suite (76 tests)", () => {
     const tests = [
       // 59 main tests
