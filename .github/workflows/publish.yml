@@ -10,9 +10,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    # Trusted publisher target — must match the environment configured on
+    # npmjs.com under @alexbruf/wasmkernel → Trusted Publishers. Add
+    # protection rules (required reviewers, branch restrictions, wait
+    # timer) on this environment in repo Settings if you want extra gates.
+    environment: release
+
     permissions:
       contents: read
-      id-token: write   # required for npm provenance attestation
+      id-token: write   # OIDC token for npm trusted publishing
 
     steps:
       - name: Checkout
@@ -30,6 +36,9 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
+
+      - name: Upgrade npm (>= 11.5.1 required for trusted publishing)
+        run: npm install -g npm@latest
 
       - name: Install binaryen (for wasm-opt)
         run: sudo apt-get update && sudo apt-get install -y binaryen
@@ -70,8 +79,10 @@ jobs:
           fi
           echo "publishing version $pkg"
 
-      - name: Publish to npm
+      - name: Publish to npm (trusted publisher via OIDC)
         working-directory: packages/wasmkernel
+        # No NODE_AUTH_TOKEN — npm 11+ negotiates auth with the registry
+        # via the GitHub OIDC token (id-token: write above) and the
+        # trusted publisher configuration on npmjs.com. --provenance
+        # generates the sigstore attestation in the same flow.
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
