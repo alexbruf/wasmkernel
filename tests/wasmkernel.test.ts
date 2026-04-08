@@ -14,6 +14,12 @@ const KERNEL_PATH = join(ROOT, "build", "wasmkernel.wasm");
 const GUEST_DIR = join(ROOT, "tests", "guest");
 const RUNNER = join(ROOT, "tests", "host", "run_wasmkernel.mjs");
 
+// Skip the multi-minute test groups when WASMKERNEL_QUICK_TESTS=1.
+// CI sets this on PRs so checks land fast; main + tag builds run the full
+// suite (argon2, soak, emnapi compliance).
+const QUICK = process.env.WASMKERNEL_QUICK_TESTS === "1";
+const fullDescribe = QUICK ? describe.skip : describe;
+
 /**
  * Run a guest wasm inside wasmkernel via subprocess.
  * Returns { exitCode, stdout, stderr }.
@@ -48,7 +54,10 @@ describe("Phase 1: build", () => {
 
   test("binary size under 400KB", () => {
     const stat = statSync(KERNEL_PATH);
-    expect(stat.size).toBeLessThan(1024 * 1024); // asyncify adds ~600KB
+    // wasm-opt -Oz + asyncify + strip-debug + strip-producers gets us
+    // around 300 KB. 400 KB is the regression budget — if it goes over,
+    // something probably regressed in CMakeLists.txt's POST_BUILD step.
+    expect(stat.size).toBeLessThan(400 * 1024);
   });
 });
 
@@ -186,6 +195,16 @@ describe("Phase 4: hardening (WAMR wasi-threads test suite)", () => {
     expect(s?.status).toBe(1);
   });
 
+  test("watchdog trips on infinite loop within budget", () => {
+    // Runs tests/guest/infinite_loop.wasm through the kernel with a
+    // 500ms wall-clock watchdog. Scheduler must terminate the guest
+    // and report the watchdog-tripped flag within a reasonable window.
+    const result = runNodeTest("tests/host/test_watchdog.mjs");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("PASS");
+    expect(result.stdout).toContain("watchdog tripped: 1");
+  }, 10000);
+
   /* Sanity test for kernel_call_indirect: load a guest, call its exported
    * function via the indirect function table. The full asyncify suspend/
    * resume path is tested end-to-end by the emnapi tsfn suite (which calls
@@ -248,8 +267,75 @@ describe("Phase 5: Oxide integration", () => {
   });
 });
 
-describe("Phase 5: emnapi Node-API compliance suite", () => {
-  test("emnapi compliance suite (70 tests)", () => {
+fullDescribe("Phase 5: real napi-rs package — @node-rs/argon2", () => {
+  // Tests argon2's upstream test suite (ported to sync API) against the
+  // published wasm32-wasip1-threads binary. This exercises the napi-rs
+  // register_module_v1 pattern and real CPU-heavy compute through the
+  // host bridge — the path that found the fuel-exhaustion bug in
+  // kernel_call_indirect.
+  test("argon2 hash/verify — 15 upstream tests", () => {
+    const result = runNodeTest("tests/host/test_argon2.mjs");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("15 passed, 0 failed");
+  }, 120000);
+});
+
+describe("Phase 5: real napi-rs package — @node-rs/bcrypt", () => {
+  // Tests @node-rs/bcrypt against the published wasm32-wasip1-threads
+  // binary. Exercises crypto (salt generation, hashing, verification),
+  // polymorphic Rust args (Either<String, &[u8]>), and Option<T> args.
+  test("bcrypt hash/verify/salt — 11 tests", () => {
+    const result = runNodeTest("tests/host/test_bcrypt.mjs");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("11 passed, 0 failed");
+  }, 60000);
+});
+
+describe("Phase 5: real napi-rs package — oxc-parser", () => {
+  // CI-stable smoke test against the published wasm binary. The deeper
+  // 46-test upstream suite runs via tests/ext/run_oxc_parser_upstream.mjs
+  // which fetches and executes oxc-parser's actual upstream test file —
+  // not part of CI because it depends on network and external sources.
+  test("oxc-parser smoke — module load + parseSync sanity", () => {
+    const result = runNodeTest("tests/host/test_oxc_parser.mjs");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("6 passed, 0 failed");
+  }, 60000);
+});
+
+describe("Phase 5: @wasmkernel/runtime package — drop-in for @napi-rs/wasm-runtime", () => {
+  // Verifies the package exposes the right API surface: direct ESM
+  // loadNapiRs works, AND the CJS entry works as a drop-in replacement
+  // when an unmodified published .wasi.cjs loader requires it as
+  // '@napi-rs/wasm-runtime'.
+  test("package: direct + drop-in both work", () => {
+    // Keep packaged kernel in sync with the fresh build before the test
+    // runs. In a real repo this would be a prepack hook.
+    const fs = require("fs");
+    fs.copyFileSync(
+      join(ROOT, "build", "wasmkernel.wasm"),
+      join(ROOT, "packages", "wasmkernel", "wasmkernel.wasm")
+    );
+    const result = runNodeTest("tests/host/test_package.mjs");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("2 passed, 0 failed");
+  }, 60000);
+});
+
+fullDescribe("Phase 5: soak — no unbounded memory growth", () => {
+  // 10k oxc-parser parseSync calls in an async-yielding loop. Catches
+  // "we forgot to release X" bugs in the napi runtime (handles, refs,
+  // wraps, finalizer registration, scheduler thread slots). Runs in
+  // ~2 seconds; the guard is steady-state RSS growth after warmup.
+  test("10k parseSync loop stays within 30 MB growth budget", () => {
+    const result = runNodeTest("tests/host/test_soak.mjs");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("PASS");
+  }, 60000);
+});
+
+fullDescribe("Phase 5: emnapi Node-API compliance suite", () => {
+  test("emnapi compliance suite (76 tests)", () => {
     const tests = [
       // 59 main tests
       "hello", "arg", "callback", "objfac", "fnfac", "function",
@@ -266,11 +352,13 @@ describe("Phase 5: emnapi Node-API compliance suite", () => {
       "passwrap", "tsfn_abort",
       "tsfn", "pool", "uv_threadpool_size", "trap_in_thread",
       "async_cleanup_hook", "typedarray", "tsfn_shutdown", "string_mt",
-      // 11 sub-tests within existing test directories — same wasm,
+      // 17 sub-tests within existing test directories — same wasm,
       // different test JS exercising different APIs/edge cases
       "async_hooks", "async_context_gcable", "async_context_gcable_cb",
       "general_global", "general_status", "number_null", "wrap_double_free",
       "constructor_null", "string_null", "object_null", "general_finalizer",
+      "general_run", "exception_finalizer", "finalizer_fatal", "objwrapref",
+      "async_st", "tsfn2_st",
     ];
     const result = runNodeTest(`tests/emnapi/run_all.mjs ${tests.join(" ")}`);
     expect(result.exitCode).toBe(0);
