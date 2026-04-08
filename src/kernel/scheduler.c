@@ -10,6 +10,7 @@
 #include "wasm_export.h"
 #include "wasm_exec_env.h"
 #include "wasm_suspend_flags.h"
+#include "thread_manager.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -80,11 +81,26 @@ wasmkernel_scheduler_register_thread(wasm_exec_env_t exec_env,
                                      void *(*start_routine)(void *),
                                      void *arg)
 {
-    if (g_scheduler.num_threads >= WASMKERNEL_MAX_THREADS)
-        return -1;
+    /* Try to reclaim an exited slot before extending the table. Without
+     * this, a long-running guest that spawns and joins many short-lived
+     * threads would walk off the end of the slot array even though most
+     * slots are dead. (WAMR's own thread manager uses live count for its
+     * --max-threads check; our slot table just needs to keep up.) */
+    uint32_t idx = WASMKERNEL_MAX_THREADS;
+    for (uint32_t i = 0; i < g_scheduler.num_threads; i++) {
+        if (g_scheduler.threads[i].state == THREAD_EXITED
+            || g_scheduler.threads[i].state == THREAD_UNUSED) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx == WASMKERNEL_MAX_THREADS) {
+        if (g_scheduler.num_threads >= WASMKERNEL_MAX_THREADS)
+            return -1;
+        idx = g_scheduler.num_threads++;
+    }
 
     int32_t tid = g_scheduler.next_tid++;
-    uint32_t idx = g_scheduler.num_threads++;
 
     WasmKernelThread *t = &g_scheduler.threads[idx];
     t->exec_env = exec_env;
@@ -309,6 +325,19 @@ wasmkernel_scheduler_step(void)
     if (!has_live_threads())
         return 1; /* all done */
 
+    /* Wall-clock watchdog: if the host set a deadline and we've passed
+     * it, kill everything. This bounds how long a guest can hold the
+     * scheduler before the host regains control, defending against
+     * infinite loops and slow pathological workloads. The host resets
+     * the deadline via kernel_set_watchdog_ms before each batch. */
+    if (g_scheduler.watchdog_deadline_us != 0
+        && get_time_us() > g_scheduler.watchdog_deadline_us) {
+        g_scheduler.watchdog_tripped = true;
+        g_scheduler.has_trap = true;
+        terminate_all_threads();
+        return -1;
+    }
+
     /* Check wait timeouts and I/O completions */
     check_wait_timeouts();
     check_io_completions();
@@ -383,16 +412,21 @@ wasmkernel_scheduler_step(void)
                 thread->start_routine(thread->exec_env);
             }
         } else {
-            /* Main thread: look up entry point */
+            /* Main thread: look up entry point. For reactor/library modules
+             * (no _start and no _initialize), the wasm `start` section has
+             * already run during instantiation and there's nothing else to
+             * do — do NOT fall back to wasm_application_execute_main, which
+             * sets a sticky "entry point symbol not found" exception that
+             * poisons subsequent kernel_call invocations. */
             wasm_function_inst_t start_func =
                 wasm_runtime_lookup_function(inst, "_start");
             if (!start_func)
                 start_func = wasm_runtime_lookup_function(inst, "_initialize");
             if (start_func) {
                 wasm_runtime_call_wasm(thread->exec_env, start_func, 0, NULL);
-            } else {
-                wasm_application_execute_main(inst, 0, NULL);
             }
+            /* else: nothing to run; this thread will transition to EXITED
+             * below, which is exactly right for a library-style module. */
         }
 
         /* If asyncify is unwinding (fuel ran out), stop the unwind */
@@ -484,6 +518,34 @@ wasmkernel_scheduler_step(void)
 
     /* Thread returned normally */
     thread->state = THREAD_EXITED;
+
+    /* For spawned threads, release the exec_env back to WAMR's cluster
+     * so its `cluster_max_thread_num` accounting (which gates further
+     * thread_spawn calls) reflects reality. Without this, a guest that
+     * spawns and joins many threads will hit "maximum number of threads
+     * exceeded" even though no threads are actually live. We never do
+     * this for the main thread — its exec_env is owned by the kernel
+     * session and torn down via kernel_unload. */
+    if (thread != &g_scheduler.threads[0] && thread->exec_env) {
+        WASMCluster *cluster = wasm_exec_env_get_cluster(thread->exec_env);
+        if (cluster) {
+            os_mutex_lock(&cluster->lock);
+            wasm_cluster_del_exec_env(cluster, thread->exec_env);
+            os_mutex_unlock(&cluster->lock);
+        }
+        thread->exec_env = NULL;
+    }
+
+    /* Per wasi-threads semantics, when the main thread (index 0) returns,
+     * the process exits with main's status — any still-running child
+     * threads are terminated, even if they would have trapped or run
+     * longer. Child threads are detached, and joining is the user's
+     * responsibility. Without this, a long-running child can race past
+     * main and observe (or cause) state we'd otherwise miss. */
+    if (thread == &g_scheduler.threads[0]) {
+        terminate_all_threads();
+        return 1;
+    }
 
     if (all_threads_exited())
         return 1; /* all done */

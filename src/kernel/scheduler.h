@@ -78,6 +78,8 @@ typedef struct WasmKernelScheduler {
     bool has_trap;
     int32_t exit_code;
     bool exited_via_proc_exit;
+    uint64_t watchdog_deadline_us; /* 0 = disabled; else absolute deadline */
+    bool     watchdog_tripped;
 } WasmKernelScheduler;
 
 /* Global scheduler instance */

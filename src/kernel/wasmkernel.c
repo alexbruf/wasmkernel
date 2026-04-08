@@ -23,6 +23,9 @@
 
 static RuntimeInitArgs g_init_args;
 static bool g_initialized = false;
+
+/* See kernel_set_min_initial_pages comment below for what this does. */
+static uint32_t g_min_initial_pages = 0;
 static wasm_module_t g_guest_module = NULL;
 static wasm_module_inst_t g_guest_instance = NULL;
 static wasm_exec_env_t g_guest_exec_env = NULL;
@@ -769,6 +772,7 @@ kernel_load(uint32_t wasm_ptr, uint32_t wasm_len)
         }
     }
 
+
     /* 256KB stack, 64MB heap — large guests like oxide need ~62MB shared memory */
     /* Fix: WAMR's internal processing can reduce max_page_count below the
        module's declared value. For non-shared growable memory, ensure max
@@ -782,6 +786,26 @@ kernel_load(uint32_t wasm_ptr, uint32_t wasm_len)
                 && m->memories[i].max_page_count < 8192) {
                 m->memories[i].max_page_count = 8192;
             }
+        }
+    }
+
+    /* Optional: bump init memory to match what an external host would
+     * inject (see kernel_set_min_initial_pages comment). Only does
+     * anything if the host asked. Never exceeds the module's max. */
+    if (g_min_initial_pages > 0) {
+        WASMModule *m = (WASMModule *)g_guest_module;
+        uint32_t want = g_min_initial_pages;
+        for (uint32_t i = 0; i < m->import_memory_count; i++) {
+            uint32_t mx = m->import_memories[i].u.memory.mem_type.max_page_count;
+            uint32_t eff = (want < mx) ? want : mx;
+            if (m->import_memories[i].u.memory.mem_type.init_page_count < eff)
+                m->import_memories[i].u.memory.mem_type.init_page_count = eff;
+        }
+        for (uint32_t i = 0; i < m->memory_count; i++) {
+            uint32_t mx = m->memories[i].max_page_count;
+            uint32_t eff = (want < mx) ? want : mx;
+            if (m->memories[i].init_page_count < eff)
+                m->memories[i].init_page_count = eff;
         }
     }
     g_guest_instance = wasm_runtime_instantiate(g_guest_module,
@@ -951,8 +975,14 @@ kernel_call_indirect(uint32_t table_idx, uint32_t argc, uint32_t argv_ptr)
     extern bool g_main_thread_asyncify_enabled;
     g_main_thread_asyncify_enabled = true;
 
-    /* Ensure plenty of fuel for direct calls */
-    g_guest_exec_env->instructions_to_execute = 100000000;
+    /* Disable fuel metering for direct calls: negative value means "no
+     * limit" per CHECK_INSTRUCTION_LIMIT. Host-initiated calls must run
+     * to completion — if they yield mid-execution on a fuel boundary,
+     * argv[0] is never written with the real return value and we'd
+     * silently read a stale pre-call value instead. Real CPU-heavy
+     * native addons (argon2, image codecs, parsers) can easily burn
+     * hundreds of millions of instructions in a single call. */
+    g_guest_exec_env->instructions_to_execute = -1;
     if (!wasm_runtime_call_indirect(g_guest_exec_env, table_idx, argc, argv)) {
         g_main_thread_asyncify_enabled = false;
         const char *exc = wasm_runtime_get_exception(g_guest_instance);
@@ -1060,6 +1090,78 @@ kernel_set_fuel(uint32_t fuel_per_slice)
 {
     if (fuel_per_slice > 0)
         g_scheduler.fuel_per_slice = fuel_per_slice;
+}
+
+/* Minimum initial memory pages to force on the next kernel_load. Used
+ * to match emnapi's `new WebAssembly.Memory({initial: 4000, ...})` that
+ * the published `parser.wasi.cjs` passes in via overwriteImports, so
+ * napi-rs guests see the same initial pool size as they would on V8.
+ *
+ * This is not a sidestep of a WAMR interpreter bug: napi-rs guests
+ * actually declare initial=980 pages but emnapi REPLACES the import
+ * with a 4000-page memory at load time. Our WAMR build reads the
+ * declared 980, Rust's wasi-libc allocator places the heap based on
+ * that, and the resulting addresses differ from V8's. Setting this
+ * to 4000 before kernel_load makes us match V8's effective layout.
+ *
+ * 0 = don't override (use module-declared initial). */
+__attribute__((export_name("kernel_set_min_initial_pages")))
+void
+kernel_set_min_initial_pages(uint32_t pages)
+{
+    g_min_initial_pages = pages;
+}
+
+/* Wall-clock watchdog. The host calls this to set a budget (in
+ * milliseconds from now) for guest execution. If the scheduler finds
+ * the deadline has passed, it terminates all threads and kernel_step
+ * returns -1. Pass 0 to disable.
+ *
+ * The watchdog is checked at the top of every scheduler tick, so it
+ * bounds how long a guest can run BETWEEN host-initiated calls. It
+ * does not interrupt direct kernel_call / kernel_call_indirect paths,
+ * which are meant for short host-initiated callbacks. The host should
+ * also track wall-clock around those and kill the process if they
+ * exceed a hard limit — that's a separate concern.
+ *
+ * A reasonable default for production: 5000 ms. Compute-heavy workloads
+ * (argon2 with high memoryCost, big parser runs) might need 30000 ms. */
+__attribute__((export_name("kernel_set_watchdog_ms")))
+void
+kernel_set_watchdog_ms(uint32_t ms)
+{
+    if (ms == 0) {
+        g_scheduler.watchdog_deadline_us = 0;
+        g_scheduler.watchdog_tripped = false;
+        return;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL
+                      + (uint64_t)ts.tv_nsec / 1000ULL;
+    g_scheduler.watchdog_deadline_us = now_us + (uint64_t)ms * 1000ULL;
+    g_scheduler.watchdog_tripped = false;
+}
+
+__attribute__((export_name("kernel_watchdog_tripped")))
+uint32_t
+kernel_watchdog_tripped(void)
+{
+    return g_scheduler.watchdog_tripped ? 1 : 0;
+}
+
+/* Set the per-instance maximum thread count. Capped at WASMKERNEL_MAX_THREADS
+ * (compile-time array bound). Affects WAMR's wasi-threads spawn limit so the
+ * guest sees thread_spawn return -1 once the cap is hit. */
+__attribute__((export_name("kernel_set_max_threads")))
+void
+kernel_set_max_threads(uint32_t max_threads)
+{
+    if (max_threads == 0)
+        max_threads = 1;
+    if (max_threads > WASMKERNEL_MAX_THREADS)
+        max_threads = WASMKERNEL_MAX_THREADS;
+    wasm_runtime_set_max_thread_num(max_threads);
 }
 
 __attribute__((export_name("kernel_thread_count")))
