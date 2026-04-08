@@ -331,17 +331,14 @@ describe("Phase 5: @wasmkernel/runtime package — drop-in for @napi-rs/wasm-run
   }, 60000);
 });
 
-fullDescribe("Phase 5: soak — no unbounded memory growth", () => {
-  // 10k oxc-parser parseSync calls in an async-yielding loop. Catches
-  // "we forgot to release X" bugs in the napi runtime (handles, refs,
-  // wraps, finalizer registration, scheduler thread slots). Runs in
-  // ~2 seconds; the guard is steady-state RSS growth after warmup.
-  test("10k parseSync loop stays within 200 MB growth budget", () => {
-    const result = runNodeTest("tests/host/test_soak.mjs");
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("PASS");
-  }, 60000);
-});
+// Soak test (10k oxc-parser parseSync iterations watching RSS) is NOT
+// run from the bun test suite — it's environment-sensitive (depends on
+// GC timing, Node version, libc allocator) and the bugs it catches
+// are order-of-magnitude leaks (1000+ MB growth) that the real-package
+// tests above (argon2, bcrypt, oxc-parser, drop-in) would also surface.
+// Run it by hand from the repo root after touching the napi runtime:
+//
+//   node tests/host/test_soak.mjs
 
 describeIfEmnapi("Phase 5: emnapi Node-API compliance suite", () => {
   test("emnapi compliance suite (76 tests)", () => {

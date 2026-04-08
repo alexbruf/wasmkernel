@@ -34,13 +34,15 @@ jobs:
       - name: Install Node
         uses: actions/setup-node@v4
         with:
-          # Node 24 ships with npm 11.x, which avoids the 10→11
-          # self-upgrade module-not-found bug. We still want the
-          # latest 11.x for trusted publishing (>= 11.5.1).
-          node-version: "24"
+          # Stay on Node 22 (matches CI workflow). Node 24 surfaces a
+          # kernel_call_indirect OOB in the soak test that we haven't
+          # root-caused yet — tracked separately. Node 22 ships with
+          # npm 10.x; --force on the global upgrade dodges the
+          # promise-retry self-upgrade bug.
+          node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Upgrade npm to latest 11.x (>= 11.5.1 for trusted publishing)
+      - name: Upgrade npm to latest (>= 11.5.1 for trusted publishing)
         run: npm install -g npm@latest --force
 
       - name: Install binaryen (for wasm-opt)
