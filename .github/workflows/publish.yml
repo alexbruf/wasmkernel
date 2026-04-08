@@ -34,15 +34,15 @@ jobs:
       - name: Install Node
         uses: actions/setup-node@v4
         with:
-          # Stay on Node 22 (matches CI workflow). Node 24 surfaces a
-          # kernel_call_indirect OOB in the soak test that we haven't
-          # root-caused yet — tracked separately. Node 22 ships with
-          # npm 10.x; --force on the global upgrade dodges the
-          # promise-retry self-upgrade bug.
-          node-version: "22"
+          # Node 24 ships with npm 11.x. Crossing the npm 10→11
+          # boundary via global self-upgrade hits a known
+          # MODULE_NOT_FOUND on promise-retry that --force doesn't
+          # fix (verified on Node 22 in earlier publish runs).
+          # Staying on Node 24 keeps the upgrade intra-major.
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Upgrade npm to latest (>= 11.5.1 for trusted publishing)
+      - name: Upgrade npm to latest 11.x (>= 11.5.1 for trusted publishing)
         run: npm install -g npm@latest --force
 
       - name: Install binaryen (for wasm-opt)
