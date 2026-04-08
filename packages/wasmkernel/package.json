@@ -1,0 +1,51 @@
+{
+  "name": "@alexbruf/wasmkernel",
+  "version": "0.1.0",
+  "description": "Drop-in replacement for @napi-rs/wasm-runtime backed by wasmkernel (WAMR cooperatively scheduled). Runs napi-rs addons in Node, browsers, and workers from a single package.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alexbruf/wasmkernel.git"
+  },
+  "exports": {
+    ".": {
+      "workerd": "./src/entry-worker.js",
+      "worker": "./src/entry-worker.js",
+      "browser": "./src/entry-browser.js",
+      "node": {
+        "import": "./src/entry-node.js",
+        "require": "./src/entry-node.cjs"
+      },
+      "default": {
+        "import": "./src/entry-node.js",
+        "require": "./src/entry-node.cjs"
+      }
+    },
+    "./node": {
+      "import": "./src/entry-node.js",
+      "require": "./src/entry-node.cjs"
+    },
+    "./browser": "./src/entry-browser.js",
+    "./worker": "./src/entry-worker.js",
+    "./wasmkernel.wasm": "./wasmkernel.wasm"
+  },
+  "files": [
+    "src/**",
+    "wasmkernel.wasm",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "prepublishOnly": "node -e \"if (!require('fs').existsSync('wasmkernel.wasm')) { console.error('refusing to publish: wasmkernel.wasm is missing — run scripts/build-kernel.sh && scripts/sync-package.sh from the repo root first'); process.exit(1); }\""
+  },
+  "peerDependenciesMeta": {
+    "@bjorn3/browser_wasi_shim": {
+      "optional": true
+    }
+  },
+  "peerDependencies": {
+    "@bjorn3/browser_wasi_shim": "^0.4.0"
+  },
+  "keywords": ["napi", "wasm", "wasi", "wamr", "napi-rs", "emnapi"]
+}
