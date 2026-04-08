@@ -34,11 +34,14 @@ jobs:
       - name: Install Node
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          # Node 24 ships with npm 11.x, which avoids the 10→11
+          # self-upgrade module-not-found bug. We still want the
+          # latest 11.x for trusted publishing (>= 11.5.1).
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Upgrade npm (>= 11.5.1 required for trusted publishing)
-        run: npm install -g npm@latest
+      - name: Upgrade npm to latest 11.x (>= 11.5.1 for trusted publishing)
+        run: npm install -g npm@latest --force
 
       - name: Install binaryen (for wasm-opt)
         run: sudo apt-get update && sudo apt-get install -y binaryen
