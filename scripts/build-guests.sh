@@ -31,10 +31,12 @@ if [ -f tests/guest/stack_overflow.c ]; then
 fi
 
 echo "=== threaded guests ==="
+# Only compile the guests actually exercised by tests/wasmkernel.test.ts.
+# thread_simple.c / thread_spawn.c / parallel_sum.c are dev-era scratch
+# programs still in tests/guest/ but not part of the suite.
 THREAD_FLAGS="-matomics -mbulk-memory -Wl,--shared-memory,--import-memory,--export-memory,--max-memory=1048576 -Wl,--export=wasi_thread_start"
 for src in tests/guest/thread_raw.c tests/guest/mutex_counter.c \
-           tests/guest/many_threads.c tests/guest/parallel_sum.c \
-           tests/guest/thread_simple.c tests/guest/thread_spawn.c \
+           tests/guest/many_threads.c \
            tests/guest/sleep_and_compute.c tests/guest/fuel_fairness.c; do
     [ -f "$src" ] || continue
     out="${src%.c}.wasm"
