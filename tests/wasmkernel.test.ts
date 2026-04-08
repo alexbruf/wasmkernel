@@ -336,7 +336,7 @@ fullDescribe("Phase 5: soak — no unbounded memory growth", () => {
   // "we forgot to release X" bugs in the napi runtime (handles, refs,
   // wraps, finalizer registration, scheduler thread slots). Runs in
   // ~2 seconds; the guard is steady-state RSS growth after warmup.
-  test("10k parseSync loop stays within 30 MB growth budget", () => {
+  test("10k parseSync loop stays within 200 MB growth budget", () => {
     const result = runNodeTest("tests/host/test_soak.mjs");
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("PASS");
