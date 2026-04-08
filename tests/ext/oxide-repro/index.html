@@ -1,0 +1,95 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>wasmkernel + oxide Scanner ctor hang repro</title>
+  <style>
+    body { font-family: ui-monospace, Menlo, monospace; max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
+    pre { background: #f4f4f4; padding: 1rem; border-radius: 6px; overflow: auto; font-size: 12px; max-height: 60vh; }
+    .err { color: #c33; }
+    .ok { color: #2a7; }
+  </style>
+</head>
+<body>
+<h1>wasmkernel + @tailwindcss/oxide Scanner ctor hang repro</h1>
+<p>
+  Loading <code>tailwindcss-oxide.wasm32-wasi.wasm</code> via
+  <code>@alexbruf/wasmkernel</code>'s browser entry, then calling
+  <code>new Scanner({ sources: [] })</code>.
+</p>
+<p>Expected: see <span class="ok">"[4] &check; Scanner created"</span> within seconds.<br>
+Actual: hangs after <span class="err">"[3] &check; Scanner type: function"</span>.</p>
+<pre id="log"></pre>
+
+<script type="module">
+// Loads the LOCAL wasmkernel source from /wasmkernel/ and the vendored
+// browser_wasi_shim from /vendor/. The static server rewrites those paths.
+import { instantiateNapiModule } from "/wasmkernel/src/entry-browser.js";
+import { WASI, PreopenDirectory } from "/vendor/browser_wasi_shim/index.js";
+
+const logEl = document.getElementById("log");
+const log = (msg, cls = "") => {
+  console.log(msg);
+  const line = document.createElement("span");
+  if (cls) line.className = cls;
+  line.textContent = msg + "\n";
+  logEl.appendChild(line);
+};
+
+async function main() {
+  log("[1] fetching oxide WASM bytes...");
+  const wasmRes = await fetch("/oxide.wasm");
+  const wasmBytes = new Uint8Array(await wasmRes.arrayBuffer());
+  log("[1] ok oxide WASM bytes: " + wasmBytes.byteLength, "ok");
+
+  log("[2] building empty WASI...");
+  const wasi = new WASI([], [], [new PreopenDirectory("/", new Map())], { debug: false });
+  log("[2] ok WASI built with empty fs", "ok");
+
+  log("[3] instantiating oxide via wasmkernel...");
+  const t0 = performance.now();
+  const { napiModule } = await instantiateNapiModule(wasmBytes, { wasi });
+  const napi = napiModule.exports;
+  const instMs = (performance.now() - t0).toFixed(0);
+  log(`[3] ok instantiate done in ${instMs}ms - napi exports: ${Object.keys(napi).join(", ")}`, "ok");
+  log("[3] ok Scanner type: " + typeof napi.Scanner, "ok");
+
+  log("[4a] new Scanner({ sources: [] }) ...");
+  let t = performance.now();
+  try {
+    const emptyScanner = new napi.Scanner({ sources: [] });
+    log(`[4a] ok empty Scanner in ${(performance.now() - t).toFixed(0)}ms`, "ok");
+  } catch (e) {
+    log("[4a] err empty Scanner: " + e.message, "err");
+  }
+
+  log("[4b] new Scanner({ sources: [{ base, pattern, negated }] }) ...");
+  t = performance.now();
+  try {
+    const realScanner = new napi.Scanner({
+      sources: [{ base: "/src", pattern: "**/*.html", negated: false }],
+    });
+    log(`[4b] ok real-source Scanner in ${(performance.now() - t).toFixed(0)}ms`, "ok");
+
+    log("[5a] realScanner.scan() ...");
+    t = performance.now();
+    const r = realScanner.scan();
+    log(`[5a] ok scan() -> ${r.length} candidates in ${(performance.now() - t).toFixed(0)}ms`, "ok");
+
+    log("[5b] realScanner.scanFiles([{file, content, extension}]) ...");
+    t = performance.now();
+    const content = '<div class="flex items-center bg-blue-500 p-4">hi</div>';
+    const res = realScanner.scanFiles([
+      { file: "/src/index.html", content, extension: "html" },
+    ]);
+    log(`[5b] ok scanFiles() -> ${JSON.stringify(res).slice(0, 200)} in ${(performance.now() - t).toFixed(0)}ms`, "ok");
+  } catch (e) {
+    log("[4b/5] err: " + e.message, "err");
+    log(e.stack || "(no stack)", "err");
+  }
+}
+
+main().catch(e => log("FATAL: " + (e?.stack ?? e), "err"));
+</script>
+</body>
+</html>
