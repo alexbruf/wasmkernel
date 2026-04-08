@@ -14,6 +14,7 @@
  */
 import { NapiRuntime } from "./napi_runtime.js";
 import { defaultWasiBridges, WASI_ENOSYS } from "./wasi_bridge.js";
+import { wasiPassthrough } from "./wasi_passthrough.js";
 
 /** @param {Uint8Array} kernelBytes
  *  @param {Uint8Array} guestBytes
@@ -85,12 +86,34 @@ export async function instantiateNapiModule(kernelBytes, guestBytes, opts = {}) 
 
   const napiRuntime = new NapiRuntime(k);
 
-  // Full empty-VFS WASI bridge for the GUEST's wasi_snapshot_preview1
-  // imports. Callers override individual functions via opts.wasiBridges
-  // to plug in real filesystems / stdin / etc.
+  // Build the guest-side WASI bridge table in three layers, last wins:
+  //
+  // 1. defaultWasiBridges: empty-VFS stubs that return proper errnos
+  //    for addons that never touch the filesystem (oxc-parser, argon2,
+  //    bcrypt). Every function writes result pointers properly instead
+  //    of silent 0n, so a no-fs addon gets a clean "ENOENT everywhere"
+  //    environment rather than uninitialised memory.
+  //
+  // 2. wasiPassthrough(opts.wasi): automatically forward every wasi
+  //    function the caller's wasi library implements (node:wasi,
+  //    @bjorn3/browser_wasi_shim, etc.), with pointer translation
+  //    applied so the shim's memory reads/writes land in the guest
+  //    memory region. Callers populate their wasi with a real or
+  //    in-memory filesystem via its normal API — no bridges boilerplate.
+  //
+  // 3. opts.wasiBridges: user overrides on top of everything else, for
+  //    callers who want to intercept a specific function (e.g. trace,
+  //    virtual stdin, custom random). Accepts either a plain object or
+  //    a `(kernel) => object` factory.
+  const passthrough = wasiPassthrough({ wasi: opts.wasi })(k);
+  const userBridges =
+    typeof opts.wasiBridges === "function"
+      ? opts.wasiBridges(k)
+      : (opts.wasiBridges || {});
   const wasiBridges = {
     ...defaultWasiBridges(() => k),
-    ...(opts.wasiBridges || {}),
+    ...passthrough,
+    ...userBridges,
   };
 
   // Wire bridges.
@@ -113,8 +136,8 @@ export async function instantiateNapiModule(kernelBytes, guestBytes, opts = {}) 
       bridgeFunctions.set(i, (args, argsPtr) => napiRuntime.dispatch(fn, args, argsPtr));
     } else if (mod === "wasi_snapshot_preview1" && wasiBridges[field]) {
       const handler = wasiBridges[field];
-      bridgeFunctions.set(i, (args) => {
-        const r = handler(args);
+      bridgeFunctions.set(i, (args, argsPtr) => {
+        const r = handler(args, argsPtr);
         return typeof r === "bigint" ? r : BigInt(r ?? 0);
       });
     } else {
@@ -161,26 +184,43 @@ export async function instantiateNapiModule(kernelBytes, guestBytes, opts = {}) 
   // beforeInit hook — emnapi calls this to let callers run
   // __napi_register__* functions on the raw instance. Our "instance" is
   // a stand-in object whose .exports maps export names to wrappers.
+  //
+  // napi-rs emits register functions in declaration order but the wasm
+  // export section may reorder them. __napi_register__<T>_struct_N must
+  // run before __napi_register__<T>_impl_N (struct defines the class,
+  // impl adds methods). Sort by the trailing integer so calls happen in
+  // source-declaration order regardless of export layout.
+  const _asyncNapiRegisterNames = guestExports
+    .filter((e) => e.kind === "function" && e.name.startsWith("__napi_register__"))
+    .map((e) => ({ name: e.name, idx: (/_(\d+)$/.exec(e.name) || [])[1] }))
+    .map(({ name, idx }) => ({ name, idx: idx ? parseInt(idx, 10) : Number.MAX_SAFE_INTEGER }))
+    .sort((a, b) => a.idx - b.idx)
+    .map((e) => e.name);
+
   const stubInstance = {
     exports: Object.fromEntries(
-      guestExports
-        .filter((e) => e.kind === "function" && e.name.startsWith("__napi_register__"))
-        .map((e) => [e.name, () => kernelCall(e.name)])
+      _asyncNapiRegisterNames.map((name) => [name, () => kernelCall(name)])
     ),
   };
   if (typeof opts.beforeInit === "function") {
     opts.beforeInit({ instance: stubInstance });
   } else {
-    // Auto-call every __napi_register__* export — matches the common pattern.
-    for (const name of Object.keys(stubInstance.exports)) stubInstance.exports[name]();
+    // Auto-call every __napi_register__* export in declaration order.
+    for (const name of _asyncNapiRegisterNames) stubInstance.exports[name]();
   }
 
   // napi_register_module_v1 → falls back to napi_register_wasm_v1.
   const ap = k.kernel_alloc(8);
   new DataView(k.memory.buffer).setUint32(ap, 1, true);
   new DataView(k.memory.buffer).setUint32(ap + 4, exportsHandle, true);
-  let callResult = kernelCall("napi_register_module_v1", ap, 2);
-  if (callResult === -2) callResult = kernelCall("napi_register_wasm_v1", ap, 2);
+  // Prefer napi_register_wasm_v1 for wasm addons — it's the entry point
+  // napi-rs wasm targets use and matches emnapi's behaviour. Fall back
+  // to napi_register_module_v1 for native-style modules that only ship
+  // the newer entry. Oxide exports both but only _wasm_v1 sets up the
+  // class the way scan() expects; calling _module_v1 leaves the napi
+  // class registration subtly different and scan() later hangs.
+  let callResult = kernelCall("napi_register_wasm_v1", ap, 2);
+  if (callResult === -2) callResult = kernelCall("napi_register_module_v1", ap, 2);
 
   if (napiRuntime.exceptionPending) {
     const e = napiRuntime.lastException;
@@ -262,9 +302,19 @@ function instantiateNapiModuleNodeSync(kernelModule, kernelBytes, guestBytes, op
 
   const napiRuntime = new NapiRuntime(k);
 
+  // Three-layer wasi bridge (see async path for the full explanation):
+  //   1. empty-VFS defaults
+  //   2. automatic passthrough to opts.wasi
+  //   3. user overrides
+  const _passthrough = wasiPassthrough({ wasi: opts.wasi })(k);
+  const _userBridges =
+    typeof opts.wasiBridges === "function"
+      ? opts.wasiBridges(k)
+      : (opts.wasiBridges || {});
   const wasiBridges = {
     ...defaultWasiBridges(() => k),
-    ...(opts.wasiBridges || {}),
+    ..._passthrough,
+    ..._userBridges,
   };
 
   const bridgeCount = k.kernel_bridge_count();
@@ -286,8 +336,8 @@ function instantiateNapiModuleNodeSync(kernelModule, kernelBytes, guestBytes, op
       bridgeFunctions.set(i, (args, argsPtr) => napiRuntime.dispatch(fn, args, argsPtr));
     } else if (mod === "wasi_snapshot_preview1" && wasiBridges[field]) {
       const handler = wasiBridges[field];
-      bridgeFunctions.set(i, (args) => {
-        const r = handler(args);
+      bridgeFunctions.set(i, (args, argsPtr) => {
+        const r = handler(args, argsPtr);
         return typeof r === "bigint" ? r : BigInt(r ?? 0);
       });
     } else {
@@ -319,24 +369,37 @@ function instantiateNapiModuleNodeSync(kernelModule, kernelBytes, guestBytes, op
   const guestModule = new WebAssembly.Module(guestBytes);
   const guestExports = WebAssembly.Module.exports(guestModule);
 
+  // Sort __napi_register__* by trailing index so struct_N runs before
+  // impl_M when M > N. See detailed explanation in the async path above.
+  const _syncNapiRegisterNames = guestExports
+    .filter((e) => e.kind === "function" && e.name.startsWith("__napi_register__"))
+    .map((e) => ({ name: e.name, idx: (/_(\d+)$/.exec(e.name) || [])[1] }))
+    .map(({ name, idx }) => ({ name, idx: idx ? parseInt(idx, 10) : Number.MAX_SAFE_INTEGER }))
+    .sort((a, b) => a.idx - b.idx)
+    .map((e) => e.name);
+
   const stubInstance = {
     exports: Object.fromEntries(
-      guestExports
-        .filter((e) => e.kind === "function" && e.name.startsWith("__napi_register__"))
-        .map((e) => [e.name, () => kernelCall(e.name)])
+      _syncNapiRegisterNames.map((name) => [name, () => kernelCall(name)])
     ),
   };
   if (typeof opts.beforeInit === "function") {
     opts.beforeInit({ instance: stubInstance });
   } else {
-    for (const name of Object.keys(stubInstance.exports)) stubInstance.exports[name]();
+    for (const name of _syncNapiRegisterNames) stubInstance.exports[name]();
   }
 
   const ap = k.kernel_alloc(8);
   new DataView(k.memory.buffer).setUint32(ap, 1, true);
   new DataView(k.memory.buffer).setUint32(ap + 4, exportsHandle, true);
-  let callResult = kernelCall("napi_register_module_v1", ap, 2);
-  if (callResult === -2) callResult = kernelCall("napi_register_wasm_v1", ap, 2);
+  // Prefer napi_register_wasm_v1 for wasm addons — it's the entry point
+  // napi-rs wasm targets use and matches emnapi's behaviour. Fall back
+  // to napi_register_module_v1 for native-style modules that only ship
+  // the newer entry. Oxide exports both but only _wasm_v1 sets up the
+  // class the way scan() expects; calling _module_v1 leaves the napi
+  // class registration subtly different and scan() later hangs.
+  let callResult = kernelCall("napi_register_wasm_v1", ap, 2);
+  if (callResult === -2) callResult = kernelCall("napi_register_module_v1", ap, 2);
 
   if (napiRuntime.exceptionPending) {
     const e = napiRuntime.lastException;

@@ -85,9 +85,19 @@ wasmkernel_scheduler_register_thread(wasm_exec_env_t exec_env,
      * this, a long-running guest that spawns and joins many short-lived
      * threads would walk off the end of the slot array even though most
      * slots are dead. (WAMR's own thread manager uses live count for its
-     * --max-threads check; our slot table just needs to keep up.) */
+     * --max-threads check; our slot table just needs to keep up.)
+     *
+     * Slot 0 is reserved for the main thread's exec_env for the lifetime
+     * of the kernel session. Reactor-style modules (e.g. napi addons) run
+     * `_start` once at load time and the main thread transitions to
+     * EXITED, but the host keeps calling guest functions on the main
+     * exec_env afterwards via kernel_call/kernel_call_indirect. If we
+     * recycled slot 0 for a spawned worker, block_on_wait would no
+     * longer find the main exec_env in the table — wait32 would silently
+     * return 0 without setting YIELD, the interpreter would never
+     * unwind, and the guest would spin forever. */
     uint32_t idx = WASMKERNEL_MAX_THREADS;
-    for (uint32_t i = 0; i < g_scheduler.num_threads; i++) {
+    for (uint32_t i = 1; i < g_scheduler.num_threads; i++) {
         if (g_scheduler.threads[i].state == THREAD_EXITED
             || g_scheduler.threads[i].state == THREAD_UNUSED) {
             idx = i;
@@ -258,9 +268,12 @@ check_io_completions(void)
     }
 }
 
-/* Find next READY thread (round-robin) */
+/* Find next READY thread (round-robin). If skip_main is true, slot 0
+ * (the main thread) is never picked — used by kernel_call_indirect's
+ * cooperative loop, where the main thread is being driven by the host
+ * caller and the scheduler should only step spawned workers. */
 static WasmKernelThread *
-pick_next_thread(void)
+pick_next_thread_ex(bool skip_main)
 {
     uint32_t n = g_scheduler.num_threads;
     if (n == 0)
@@ -268,6 +281,8 @@ pick_next_thread(void)
 
     for (uint32_t i = 0; i < n; i++) {
         uint32_t idx = (g_scheduler.current + i) % n;
+        if (skip_main && idx == 0)
+            continue;
         WasmKernelThread *t = &g_scheduler.threads[idx];
         if (t->state == THREAD_READY) {
             g_scheduler.current = (idx + 1) % n;
@@ -276,6 +291,12 @@ pick_next_thread(void)
     }
 
     return NULL;
+}
+
+static WasmKernelThread *
+pick_next_thread(void)
+{
+    return pick_next_thread_ex(false);
 }
 
 /* Check if all threads have exited */
@@ -319,8 +340,8 @@ terminate_all_threads(void)
     }
 }
 
-int32_t
-wasmkernel_scheduler_step(void)
+static int32_t
+scheduler_step_internal(bool skip_main)
 {
     if (!has_live_threads())
         return 1; /* all done */
@@ -343,30 +364,61 @@ wasmkernel_scheduler_step(void)
     check_io_completions();
 
     /* Pick next ready thread */
-    WasmKernelThread *thread = pick_next_thread();
+    WasmKernelThread *thread = pick_next_thread_ex(skip_main);
 
     if (!thread) {
-        /* All threads blocked — check if any could ever wake */
+        /* All non-skipped threads blocked — check if any could ever wake */
         if (all_threads_exited())
             return 1;
 
-        /* Deadlock: no READY threads but some are BLOCKED_WAIT.
-           Wake them all as spurious wakeups — musl/wasi-libc handles
-           spurious returns from wait32 by rechecking conditions. */
-        bool woke_any = false;
-        for (uint32_t i = 0; i < g_scheduler.num_threads; i++) {
-            WasmKernelThread *t = &g_scheduler.threads[i];
-            if (t->state == THREAD_BLOCKED_WAIT) {
-                t->state = THREAD_READY;
-                t->wait_address = NULL;
-                woke_any = true;
+        /* In skip_main mode, the cooperative loop in kernel_call_indirect
+         * is the only one that knows how to wake the main thread (it owns
+         * the saved frame). If only the main thread can run, return 2 to
+         * tell the caller "main has work to do, resume it". */
+        if (skip_main) {
+            bool any_worker_blocked = false;
+            for (uint32_t i = 1; i < g_scheduler.num_threads; i++) {
+                WasmKernelThreadState s = g_scheduler.threads[i].state;
+                if (s == THREAD_BLOCKED_WAIT || s == THREAD_BLOCKED_IO) {
+                    any_worker_blocked = true;
+                    break;
+                }
             }
+            if (!any_worker_blocked)
+                return 2; /* nothing to do here, hand control to main */
+            /* A worker is blocked — try a spurious wake on workers only */
+            bool woke_any = false;
+            for (uint32_t i = 1; i < g_scheduler.num_threads; i++) {
+                WasmKernelThread *t = &g_scheduler.threads[i];
+                if (t->state == THREAD_BLOCKED_WAIT) {
+                    t->state = THREAD_READY;
+                    t->wait_address = NULL;
+                    woke_any = true;
+                }
+            }
+            if (woke_any)
+                thread = pick_next_thread_ex(skip_main);
+            if (!thread)
+                return 2; /* still nothing — hand control to main */
+        } else {
+            /* Deadlock: no READY threads but some are BLOCKED_WAIT.
+               Wake them all as spurious wakeups — musl/wasi-libc handles
+               spurious returns from wait32 by rechecking conditions. */
+            bool woke_any = false;
+            for (uint32_t i = 0; i < g_scheduler.num_threads; i++) {
+                WasmKernelThread *t = &g_scheduler.threads[i];
+                if (t->state == THREAD_BLOCKED_WAIT) {
+                    t->state = THREAD_READY;
+                    t->wait_address = NULL;
+                    woke_any = true;
+                }
+            }
+            if (woke_any) {
+                thread = pick_next_thread();
+            }
+            if (!thread)
+                return 0; /* truly stuck (I/O wait) */
         }
-        if (woke_any) {
-            thread = pick_next_thread();
-        }
-        if (!thread)
-            return 0; /* truly stuck (I/O wait) */
     }
 
     thread->state = THREAD_RUNNING;
@@ -551,6 +603,18 @@ wasmkernel_scheduler_step(void)
         return 1; /* all done */
 
     return 0; /* other threads still running */
+}
+
+int32_t
+wasmkernel_scheduler_step(void)
+{
+    return scheduler_step_internal(false);
+}
+
+int32_t
+wasmkernel_scheduler_step_skip_main(void)
+{
+    return scheduler_step_internal(true);
 }
 
 uint32_t

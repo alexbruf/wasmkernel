@@ -105,6 +105,15 @@ wasmkernel_scheduler_register_thread(wasm_exec_env_t exec_env,
 int32_t
 wasmkernel_scheduler_step(void);
 
+/* Run one scheduler tick, but skip the main thread (slot 0).
+   Used by kernel_call_indirect's cooperative loop, where the main thread
+   is being driven by the host caller and the scheduler should only run
+   spawned worker threads. Same return values as wasmkernel_scheduler_step.
+   Returns 2 if no spawned thread is runnable (caller should treat this
+   as "main has work to do, resume it"). */
+int32_t
+wasmkernel_scheduler_step_skip_main(void);
+
 /* Block the current thread on atomic.wait */
 void
 wasmkernel_scheduler_block_on_wait(wasm_exec_env_t exec_env,

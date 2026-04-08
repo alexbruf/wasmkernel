@@ -23,6 +23,7 @@
  */
 import { NapiRuntime } from "./napi_runtime.js";
 import { defaultWasiBridges, WASI_ENOSYS } from "./wasi_bridge.js";
+import { wasiPassthrough } from "./wasi_passthrough.js";
 
 /** Fetch and cache the kernel bytes. Resolved relative to this module.
  *  Used as a default when the caller doesn't supply their own kernel
@@ -102,13 +103,22 @@ export async function instantiateNapiModule(guestBytes, options = {}) {
 
   const napiRuntime = new NapiRuntime(k);
 
-  // Full empty-VFS WASI bridge for the GUEST's wasi_snapshot_preview1
-  // imports. These run with guest-space pointers and write results into
-  // guest memory. Callers can override individual functions via
-  // `options.wasiBridges` to plug in a real filesystem / stdin / etc.
+  // Three-layer guest WASI bridge:
+  //   1. empty-VFS defaults from wasi_bridge.js
+  //   2. automatic passthrough to options.wasi — the shim the caller
+  //      already passed gets used for the guest too, with pointer
+  //      translation. Callers populate their wasi with a real or
+  //      in-memory filesystem via its normal API and it "just works".
+  //   3. options.wasiBridges — user overrides on top of everything.
+  const passthrough = wasiPassthrough({ wasi: options.wasi })(k);
+  const userBridges =
+    typeof options.wasiBridges === "function"
+      ? options.wasiBridges(k)
+      : (options.wasiBridges || {});
   const wasiBridges = {
     ...defaultWasiBridges(() => k),
-    ...(options.wasiBridges || {}),
+    ...passthrough,
+    ...userBridges,
   };
 
   const bridgeCount = k.kernel_bridge_count();
@@ -127,8 +137,8 @@ export async function instantiateNapiModule(guestBytes, options = {}) {
       bridgeFunctions.set(i, (args, argsPtr) => napiRuntime.dispatch(fn, args, argsPtr));
     } else if (mod === "wasi_snapshot_preview1" && wasiBridges[field]) {
       const handler = wasiBridges[field];
-      bridgeFunctions.set(i, (args) => {
-        const r = handler(args);
+      bridgeFunctions.set(i, (args, argsPtr) => {
+        const r = handler(args, argsPtr);
         return typeof r === "bigint" ? r : BigInt(r ?? 0);
       });
     } else {
@@ -166,21 +176,40 @@ export async function instantiateNapiModule(guestBytes, options = {}) {
   // export section ourselves keeps the whole load path bytes-only.
   const guestFuncExports = parseWasmFunctionExports(guestBytes);
 
+  // napi-rs emits register functions named `__napi_register__<Type>_struct_N`
+  // and `__napi_register__<Type>_impl_N` where N is the source-declaration
+  // order. struct MUST run before impl, and within each group the N ordering
+  // matters. Wasm export section order isn't guaranteed to match — e.g.
+  // oxide ships impl_13 before struct_4. Sort by the trailing integer so we
+  // call them in declaration order regardless of where they landed in the
+  // export section.
+  const napiRegisterNames = guestFuncExports
+    .filter((name) => name.startsWith("__napi_register__"))
+    .map((name) => {
+      const m = /_(\d+)$/.exec(name);
+      return { name, idx: m ? parseInt(m[1], 10) : Number.MAX_SAFE_INTEGER };
+    })
+    .sort((a, b) => a.idx - b.idx)
+    .map((e) => e.name);
+
   const stubInstance = {
     exports: Object.fromEntries(
-      guestFuncExports
-        .filter((name) => name.startsWith("__napi_register__"))
-        .map((name) => [name, () => kernelCall(name)])
+      napiRegisterNames.map((name) => [name, () => kernelCall(name)])
     ),
   };
   if (typeof options.beforeInit === "function") options.beforeInit({ instance: stubInstance });
-  else for (const name of Object.keys(stubInstance.exports)) stubInstance.exports[name]();
+  else for (const name of napiRegisterNames) stubInstance.exports[name]();
 
   const ap = k.kernel_alloc(8);
   new DataView(k.memory.buffer).setUint32(ap, 1, true);
   new DataView(k.memory.buffer).setUint32(ap + 4, exportsHandle, true);
-  let callResult = kernelCall("napi_register_module_v1", ap, 2);
-  if (callResult === -2) callResult = kernelCall("napi_register_wasm_v1", ap, 2);
+  // Prefer napi_register_wasm_v1 for wasm addons (matches emnapi
+  // behaviour); fall back to napi_register_module_v1 for addons that
+  // only ship the newer entry. See instantiate.js for the full
+  // rationale — calling _module_v1 on oxide leaves the class in a
+  // state where scan() hangs later.
+  let callResult = kernelCall("napi_register_wasm_v1", ap, 2);
+  if (callResult === -2) callResult = kernelCall("napi_register_module_v1", ap, 2);
 
   if (napiRuntime.exceptionPending) {
     const e = napiRuntime.lastException;

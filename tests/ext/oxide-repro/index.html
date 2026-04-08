@@ -2,29 +2,31 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>wasmkernel + oxide Scanner ctor hang repro</title>
+  <title>wasmkernel + oxide Scanner repro</title>
   <style>
     body { font-family: ui-monospace, Menlo, monospace; max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
     pre { background: #f4f4f4; padding: 1rem; border-radius: 6px; overflow: auto; font-size: 12px; max-height: 60vh; }
     .err { color: #c33; }
     .ok { color: #2a7; }
+    h2 { margin-top: 1.5rem; font-size: 1rem; color: #555; }
   </style>
 </head>
 <body>
-<h1>wasmkernel + @tailwindcss/oxide Scanner ctor hang repro</h1>
+<h1>wasmkernel + @tailwindcss/oxide Scanner</h1>
 <p>
   Loading <code>tailwindcss-oxide.wasm32-wasi.wasm</code> via
-  <code>@alexbruf/wasmkernel</code>'s browser entry, then calling
-  <code>new Scanner({ sources: [] })</code>.
+  <code>@alexbruf/wasmkernel</code>'s browser entry and exercising the
+  full Scanner path — empty VFS (default) then in-memory VFS via
+  <code>createVfsBridges</code>.
 </p>
-<p>Expected: see <span class="ok">"[4] &check; Scanner created"</span> within seconds.<br>
-Actual: hangs after <span class="err">"[3] &check; Scanner type: function"</span>.</p>
 <pre id="log"></pre>
 
 <script type="module">
 // Loads the LOCAL wasmkernel source from /wasmkernel/ and the vendored
-// browser_wasi_shim from /vendor/. The static server rewrites those paths.
+// browser_wasi_shim from /vendor/.
+globalThis.__WK_TRACE__ = true; // DEBUG: enable bridge trace logging
 import { instantiateNapiModule } from "/wasmkernel/src/entry-browser.js";
+import { createVfsBridges } from "/wasmkernel/src/vfs_bridge.js";
 import { WASI, PreopenDirectory } from "/vendor/browser_wasi_shim/index.js";
 
 const logEl = document.getElementById("log");
@@ -36,60 +38,77 @@ const log = (msg, cls = "") => {
   logEl.appendChild(line);
 };
 
-async function main() {
-  log("[1] fetching oxide WASM bytes...");
+async function instantiate(label, extraOpts = {}) {
   const wasmRes = await fetch("/oxide.wasm");
   const wasmBytes = new Uint8Array(await wasmRes.arrayBuffer());
-  log("[1] ok oxide WASM bytes: " + wasmBytes.byteLength, "ok");
-
-  log("[2] building empty WASI...");
   const wasi = new WASI([], [], [new PreopenDirectory("/", new Map())], { debug: false });
-  log("[2] ok WASI built with empty fs", "ok");
-
-  log("[3] instantiating oxide via wasmkernel...");
   const t0 = performance.now();
-  const { napiModule } = await instantiateNapiModule(wasmBytes, { wasi });
-  const napi = napiModule.exports;
-  const instMs = (performance.now() - t0).toFixed(0);
-  log(`[3] ok instantiate done in ${instMs}ms - napi exports: ${Object.keys(napi).join(", ")}`, "ok");
-  log("[3] ok Scanner type: " + typeof napi.Scanner, "ok");
-
-  log("[4a] new Scanner({ sources: [] }) ...");
-  let t = performance.now();
-  try {
-    const emptyScanner = new napi.Scanner({ sources: [] });
-    log(`[4a] ok empty Scanner in ${(performance.now() - t).toFixed(0)}ms`, "ok");
-  } catch (e) {
-    log("[4a] err empty Scanner: " + e.message, "err");
-  }
-
-  log("[4b] new Scanner({ sources: [{ base, pattern, negated }] }) ...");
-  t = performance.now();
-  try {
-    const realScanner = new napi.Scanner({
-      sources: [{ base: "/src", pattern: "**/*.html", negated: false }],
-    });
-    log(`[4b] ok real-source Scanner in ${(performance.now() - t).toFixed(0)}ms`, "ok");
-
-    log("[5a] realScanner.scan() ...");
-    t = performance.now();
-    const r = realScanner.scan();
-    log(`[5a] ok scan() -> ${r.length} candidates in ${(performance.now() - t).toFixed(0)}ms`, "ok");
-
-    log("[5b] realScanner.scanFiles([{file, content, extension}]) ...");
-    t = performance.now();
-    const content = '<div class="flex items-center bg-blue-500 p-4">hi</div>';
-    const res = realScanner.scanFiles([
-      { file: "/src/index.html", content, extension: "html" },
-    ]);
-    log(`[5b] ok scanFiles() -> ${JSON.stringify(res).slice(0, 200)} in ${(performance.now() - t).toFixed(0)}ms`, "ok");
-  } catch (e) {
-    log("[4b/5] err: " + e.message, "err");
-    log(e.stack || "(no stack)", "err");
-  }
+  const { napiModule } = await instantiateNapiModule(wasmBytes, { wasi, ...extraOpts });
+  const elapsed = (performance.now() - t0).toFixed(0);
+  log(`  instantiate: ${elapsed} ms`, "ok");
+  return napiModule.exports;
 }
 
-main().catch(e => log("FATAL: " + (e?.stack ?? e), "err"));
+async function main() {
+  // -------- Scenario 1: default empty VFS --------
+  log("=== scenario 1: default VFS (empty) ===");
+  let napi = await instantiate("default");
+  log(`  napi exports: ${Object.keys(napi).join(", ")}`);
+
+  let t = performance.now();
+  const emptyScanner = new napi.Scanner({ sources: [] });
+  log(`  new Scanner({ sources: [] }) ok in ${(performance.now() - t).toFixed(0)} ms`, "ok");
+
+  t = performance.now();
+  const realishScanner = new napi.Scanner({
+    sources: [{ base: "/src", pattern: "**/*.html", negated: false }],
+  });
+  log(`  new Scanner({ sources: [{base:"/src",...}] }) ok in ${(performance.now() - t).toFixed(0)} ms (empty VFS)`, "ok");
+
+  t = performance.now();
+  const r1 = realishScanner.scan();
+  log(`  scan() -> ${r1.length} candidates in ${(performance.now() - t).toFixed(0)} ms (expected 0)`, "ok");
+
+  // -------- Scenario 2: in-memory VFS with real files --------
+  log("\n=== scenario 2: createVfsBridges with real files ===");
+
+  const files = {
+    "/src/index.html":
+      new TextEncoder().encode('<div class="flex items-center bg-blue-500 p-4 text-white hover:bg-blue-600">hi</div>'),
+    "/src/pages/about.html":
+      new TextEncoder().encode('<section class="max-w-3xl mx-auto grid grid-cols-2 gap-8">about</section>'),
+    "/src/pages/contact.html":
+      new TextEncoder().encode('<form class="space-y-4"><input class="rounded-md border p-2"/></form>'),
+  };
+  log(`  VFS: ${Object.keys(files).length} files`);
+
+  napi = await instantiate("vfs", {
+    wasiBridges: createVfsBridges({ files }),
+  });
+
+  t = performance.now();
+  const scanner = new napi.Scanner({
+    sources: [{ base: "/src", pattern: "**/*.html", negated: false }],
+  });
+  log(`  new Scanner({ sources: [{base:"/src",...}] }) ok in ${(performance.now() - t).toFixed(0)} ms`, "ok");
+
+  t = performance.now();
+  const candidates = scanner.scan();
+  log(`  scan() -> ${candidates.length} candidates in ${(performance.now() - t).toFixed(0)} ms`, "ok");
+  log(`  first 12: ${JSON.stringify(candidates.slice(0, 12))}`);
+
+  t = performance.now();
+  const extra = scanner.scanFiles([
+    {
+      file: "/src/extra.tsx",
+      content: 'export const X = <div className="rounded-full shadow-xl" />;',
+      extension: "tsx",
+    },
+  ]);
+  log(`  scanFiles([{tsx}]) -> ${JSON.stringify(extra)} in ${(performance.now() - t).toFixed(0)} ms`, "ok");
+}
+
+main().catch((e) => log("FATAL: " + (e?.stack ?? e), "err"));
 </script>
 </body>
 </html>

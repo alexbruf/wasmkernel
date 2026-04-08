@@ -975,79 +975,131 @@ kernel_call_indirect(uint32_t table_idx, uint32_t argc, uint32_t argv_ptr)
     extern bool g_main_thread_asyncify_enabled;
     g_main_thread_asyncify_enabled = true;
 
-    /* Disable fuel metering for direct calls: negative value means "no
-     * limit" per CHECK_INSTRUCTION_LIMIT. Host-initiated calls must run
-     * to completion — if they yield mid-execution on a fuel boundary,
-     * argv[0] is never written with the real return value and we'd
-     * silently read a stale pre-call value instead. Real CPU-heavy
-     * native addons (argon2, image codecs, parsers) can easily burn
-     * hundreds of millions of instructions in a single call. */
-    g_guest_exec_env->instructions_to_execute = -1;
-    if (!wasm_runtime_call_indirect(g_guest_exec_env, table_idx, argc, argv)) {
-        g_main_thread_asyncify_enabled = false;
-        const char *exc = wasm_runtime_get_exception(g_guest_instance);
-        if (exc) {
-            fprintf(stderr, "kernel_call_indirect(%u): %s\n", table_idx, exc);
-            wasm_runtime_clear_exception(g_guest_instance);
+    extern int asyncify_get_state(void);
+    extern void asyncify_stop_unwind(void);
+    extern void asyncify_start_rewind(void *data);
+
+    /* Find the main thread in the scheduler. Slot 0 is reserved for the
+     * main exec_env (see comment in wasmkernel_scheduler_register_thread). */
+    WasmKernelThread *main_thread = NULL;
+    for (uint32_t i = 0; i < g_scheduler.num_threads; i++) {
+        if (g_scheduler.threads[i].exec_env == g_guest_exec_env) {
+            main_thread = &g_scheduler.threads[i];
+            break;
         }
-        /* Restore stack pointer to prevent stack leak on trap */
-        if (global_data)
-            *(uint32_t *)global_data = saved_sp;
-        return -3;
     }
 
-    /* Cooperative scheduling: if the callback blocked (e.g. wait32 inside
-     * pthread_create), step other threads until the block resolves,
-     * then resume via asyncify. */
-    {
-        extern int asyncify_get_state(void);
-        extern void asyncify_stop_unwind(void);
-        extern void asyncify_start_rewind(void *data);
-        extern void *wasmkernel_get_asyncify_buf(wasm_exec_env_t);
+    /* Cooperative loop: re-enter the interpreter as long as the call
+     * unwinds via wait32/notify (YIELD flag) or via an asyncify-blocking
+     * host call. Each iteration runs the scheduler against any other
+     * threads that may be holding the resource the main thread is
+     * waiting on, then resumes the main interpreter frame.
+     *
+     * Fuel slice gives the main thread a finite quantum of instructions
+     * before yielding back to the scheduler — necessary because rayon's
+     * "is the worker done?" path is a busy-wait on shared memory, not a
+     * wait32. Without periodic yields the main thread holds the
+     * interpreter forever and worker threads never get to run. The
+     * cooperative loop catches the yield and re-enters via the
+     * resume_bytecode path, so partial computation isn't lost. */
+    int32_t fuel_per_slice = 100000000;
+    g_guest_exec_env->instructions_to_execute = fuel_per_slice;
+    g_guest_exec_env->_spin_yield_enabled = true;
 
-        if (asyncify_get_state() == 1) {
-            /* Callback unwound via asyncify (blocked on wait32 etc.) */
+    int32_t ret = 0;
+    while (1) {
+        if (!wasm_runtime_call_indirect(g_guest_exec_env, table_idx, argc,
+                                        argv)) {
+            g_main_thread_asyncify_enabled = false;
+            const char *exc = wasm_runtime_get_exception(g_guest_instance);
+            if (exc) {
+                fprintf(stderr, "kernel_call_indirect(%u): %s\n", table_idx,
+                        exc);
+                wasm_runtime_clear_exception(g_guest_instance);
+            }
+            /* Restore stack pointer to prevent stack leak on trap */
+            if (global_data)
+                *(uint32_t *)global_data = saved_sp;
+            if (main_thread)
+                main_thread->state = THREAD_EXITED;
+            return -3;
+        }
+
+        int astate = asyncify_get_state();
+        bool yielded =
+            (WASM_SUSPEND_FLAGS_GET(g_guest_exec_env->suspend_flags)
+             & WASM_SUSPEND_FLAG_YIELD)
+            != 0;
+
+        if (astate != 1 && !yielded) {
+            /* Normal completion */
+            break;
+        }
+
+        if (astate == 1) {
             asyncify_stop_unwind();
+        }
 
-            /* Find the main thread in the scheduler */
-            WasmKernelThread *main_thread = NULL;
-            for (uint32_t i = 0; i < g_scheduler.num_threads; i++) {
-                if (g_scheduler.threads[i].exec_env == g_guest_exec_env) {
-                    main_thread = &g_scheduler.threads[i];
-                    break;
-                }
+        if (!main_thread) {
+            /* Can't drive the scheduler without the main slot — bail. */
+            ret = -4;
+            break;
+        }
+
+        /* Step worker threads (skip main — main is being driven by us
+         * and the scheduler doesn't know how to resume it from a saved
+         * frame). Loop until either main is unblocked, all workers are
+         * blocked/done, or a worker traps. */
+        int max_iters = 1000000;
+        while (--max_iters > 0) {
+            int32_t s = wasmkernel_scheduler_step_skip_main();
+            if (s < 0) {
+                /* Trap or proc_exit propagated from another thread */
+                ret = s;
+                goto done;
             }
-
-            /* Step other threads until the main thread is unblocked */
-            if (main_thread) {
-                int max_iters = 100000;
-                while (main_thread->state == THREAD_BLOCKED_WAIT
-                       && --max_iters > 0) {
-                    wasmkernel_scheduler_step();
+            if (s == 2) {
+                /* No worker is runnable — hand control back to main,
+                 * even if it's still BLOCKED_WAIT. The main thread will
+                 * re-check the condition (rayon's "is the worker done?"
+                 * flag) and either proceed or yield again. */
+                if (main_thread->state == THREAD_BLOCKED_WAIT) {
+                    main_thread->state = THREAD_READY;
+                    main_thread->wait_address = NULL;
                 }
-
-                if (main_thread->state != THREAD_BLOCKED_WAIT) {
-                    /* Resume the callback via asyncify rewind */
-                    main_thread->state = THREAD_RUNNING;
-                    WASM_SUSPEND_FLAGS_FETCH_AND(
-                        g_guest_exec_env->suspend_flags,
-                        ~WASM_SUSPEND_FLAG_YIELD);
-
-                    void *abuf = main_thread->asyncify_buf;
-                    asyncify_start_rewind(abuf);
-                    g_guest_exec_env->instructions_to_execute = 100000000;
-                    wasm_runtime_call_indirect(g_guest_exec_env, table_idx,
-                                               argc, argv);
-
-                    if (asyncify_get_state() == 1)
-                        asyncify_stop_unwind();
-                }
+                break;
+            }
+            if (main_thread->state != THREAD_BLOCKED_WAIT) {
+                break;
             }
         }
+        if (main_thread->state == THREAD_BLOCKED_WAIT) {
+            /* Spurious wake — let main re-check */
+            main_thread->state = THREAD_READY;
+            main_thread->wait_address = NULL;
+        }
+
+        main_thread->state = THREAD_RUNNING;
+
+        if (astate == 1) {
+            /* Asyncify path: rewind the C stack so the host call
+             * (e.g. wait32 invoked from a kernel callback) returns. */
+            asyncify_start_rewind(main_thread->asyncify_buf);
+        }
+        /* For pure YIELD path: leave the YIELD flag set; the next
+         * wasm_runtime_call_indirect call enters wasm_interp_call_wasm,
+         * which sees YIELD set and goes straight to resume_bytecode,
+         * picking up the saved frame and clearing the flag inside
+         * wasm_interp_call_func_bytecode's own resume path. */
+        g_guest_exec_env->instructions_to_execute = fuel_per_slice;
+        g_guest_exec_env->_spin_yield_enabled = true;
     }
 
+done:
+    if (main_thread)
+        main_thread->state = THREAD_EXITED;
     g_main_thread_asyncify_enabled = false;
-    return 0;
+    return ret;
 }
 
 /* Spawn a guest thread directly (for uv_thread_create bridge).

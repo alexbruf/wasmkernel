@@ -280,13 +280,17 @@ describe("Phase 5: N-API compliance", () => {
 });
 
 describeIfOxide("Phase 5: Oxide integration", () => {
-  test("oxide scanner produces expected CSS candidates", () => {
+  test("oxide scanner produces expected CSS candidates from nested HTML files", () => {
     const result = runNodeTest("tests/host/test_oxide.mjs");
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("Scanner created");
-    expect(result.stdout).toContain("scan count: 7");
+    // Two HTML files in nested subdirs (src/test.html, src/pages/about.html)
+    // exercise rayon's parallel par_iter path; the scheduler must
+    // cooperatively yield to spawned workers to make this terminate.
+    expect(result.stdout).toContain("scan count: 13");
     expect(result.stdout).toContain("flex");
     expect(result.stdout).toContain("bg-blue-500");
+    expect(result.stdout).toContain("grid-cols-2");
   });
 });
 

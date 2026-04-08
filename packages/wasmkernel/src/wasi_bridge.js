@@ -139,7 +139,9 @@ export function defaultWasiBridges(getKernel) {
   }
   function path_filestat_get() { return WASI_ENOENT; }
   function path_readlink(args) {
-    const [, , , , , , bufusedPtr] = args;
+    // path_readlink(fd, path_ptr, path_len, buf_ptr, buf_len, bufused_ptr)
+    // — 6 params, bufused_ptr is args[5].
+    const [, , , , , bufusedPtr] = args;
     writeU32(bufusedPtr, 0);
     return WASI_EINVAL;
   }
@@ -192,7 +194,10 @@ export function defaultWasiBridges(getKernel) {
   }
   function fd_close() { return WASI_ESUCCESS; }
   function fd_seek(args) {
-    const [, , , , newoffsetPtr] = args;
+    // fd_seek(fd, offset:i64, whence, newoffset_ptr) — i64 offset is one
+    // slot (low 32 bits only via the bridge), so the out pointer is at
+    // args[3], not args[4].
+    const [, , , newoffsetPtr] = args;
     writeU64(newoffsetPtr, 0n);
     return WASI_EBADF;
   }
