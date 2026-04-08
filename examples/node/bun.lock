@@ -1,0 +1,15 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "wasmkernel-node-example",
+      "dependencies": {
+        "@alexbruf/wasmkernel": "file:../../packages/wasmkernel",
+      },
+    },
+  },
+  "packages": {
+    "@alexbruf/wasmkernel": ["@alexbruf/wasmkernel@file:../../packages/wasmkernel", { "peerDependencies": { "@bjorn3/browser_wasi_shim": "^0.4.0" }, "optionalPeers": ["@bjorn3/browser_wasi_shim"] }],
+  }
+}

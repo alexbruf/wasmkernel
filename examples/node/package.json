@@ -1,0 +1,12 @@
+{
+  "name": "wasmkernel-node-example",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node parse.mjs"
+  },
+  "dependencies": {
+    "@alexbruf/wasmkernel": "file:../../packages/wasmkernel"
+  }
+}

@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>@alexbruf/wasmkernel — worker example</title>
+    <style>
+      body {
+        font-family: -apple-system, system-ui, sans-serif;
+        max-width: 960px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+        color: #1c1c1c;
+      }
+      h1 { font-size: 1.4rem; }
+      p { color: #555; }
+      textarea {
+        width: 100%;
+        min-height: 180px;
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+        font-size: 13px;
+        padding: 0.6rem;
+        border: 1px solid #ccc;
+        border-radius: 6px;
+        resize: vertical;
+      }
+      pre {
+        background: #f4f4f4;
+        padding: 0.8rem;
+        border-radius: 6px;
+        max-height: 380px;
+        overflow: auto;
+        font-size: 12px;
+      }
+      .row { display: flex; gap: 0.6rem; align-items: center; margin: 0.6rem 0; }
+      .status { color: #888; font-size: 13px; }
+      .err { color: #c33; }
+      .pill {
+        background: #e8f0fe;
+        color: #1a56b3;
+        padding: 0.15rem 0.55rem;
+        border-radius: 999px;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>@alexbruf/wasmkernel — Web Worker example</h1>
+    <p>
+      Same as the browser example, but the addon runs on a Web Worker so the
+      main thread stays free. Open DevTools and watch the parse latency vs
+      main-thread responsiveness.
+    </p>
+
+    <div class="row">
+      <span class="pill">main thread</span>
+      <span class="status" id="status">spawning worker …</span>
+    </div>
+
+    <textarea id="src" spellcheck="false">
+const greet = (name) => `hello, ${name}!`;
+class Counter {
+  #n = 0;
+  bump() { return ++this.#n; }
+}
+export default greet(new Counter().bump() + "");
+    </textarea>
+
+    <pre id="out">Type some JS above; AST will appear here.</pre>
+
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>

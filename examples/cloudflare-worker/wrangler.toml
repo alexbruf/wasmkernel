@@ -1,0 +1,18 @@
+name = "wasmkernel-cloudflare-example"
+main = "src/index.js"
+compatibility_date = "2025-04-01"
+# nodejs_compat is needed because @alexbruf/wasmkernel's napi_runtime.js
+# does a *lazy* `require("node:async_hooks")` to get AsyncResource on Node.
+# It gracefully falls back to null on non-Node runtimes, but esbuild
+# still has to know that import is OK to bundle.
+compatibility_flags = ["nodejs_compat"]
+
+# Bundling notes:
+#   - wasmkernel.wasm is imported as `WebAssembly.Module` (Wrangler's default
+#     behaviour for .wasm imports). We pass it to instantiateNapiModule via
+#     the `kernelModule` option so wasmkernel doesn't try to fetch it.
+#   - oxc-parser.wasm.bin is imported as `ArrayBuffer` (Wrangler's default
+#     behaviour for .bin files). wasmkernel needs the guest as raw bytes
+#     because it copies them into its own interpreter memory.
+#   - Total compressed bundle is ~800 KB (kernel ~100 KB gz + oxc-parser
+#     ~700 KB gz), comfortably under the 1 MB Workers Free plan limit.
