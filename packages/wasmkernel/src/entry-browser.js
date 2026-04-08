@@ -22,6 +22,7 @@
  * and Node's node:wasi match this shape.
  */
 import { NapiRuntime } from "./napi_runtime.js";
+import { defaultWasiBridges, WASI_ENOSYS } from "./wasi_bridge.js";
 
 /** Fetch and cache the kernel bytes. Resolved relative to this module.
  *  Used as a default when the caller doesn't supply their own kernel
@@ -101,21 +102,12 @@ export async function instantiateNapiModule(guestBytes, options = {}) {
 
   const napiRuntime = new NapiRuntime(k);
 
+  // Full empty-VFS WASI bridge for the GUEST's wasi_snapshot_preview1
+  // imports. These run with guest-space pointers and write results into
+  // guest memory. Callers can override individual functions via
+  // `options.wasiBridges` to plug in a real filesystem / stdin / etc.
   const wasiBridges = {
-    random_get(args) {
-      const [bufPtr, bufLen] = args;
-      const base = k.kernel_guest_memory_base();
-      const mem = new Uint8Array(k.memory.buffer);
-      const chunk = new Uint8Array(Math.min(bufLen, 65536));
-      let remaining = bufLen, off = 0;
-      while (remaining > 0) {
-        const n = Math.min(chunk.length, remaining);
-        crypto.getRandomValues(chunk.subarray(0, n));
-        mem.set(chunk.subarray(0, n), base + bufPtr + off);
-        off += n; remaining -= n;
-      }
-      return 0n;
-    },
+    ...defaultWasiBridges(() => k),
     ...(options.wasiBridges || {}),
   };
 
@@ -135,9 +127,23 @@ export async function instantiateNapiModule(guestBytes, options = {}) {
       bridgeFunctions.set(i, (args, argsPtr) => napiRuntime.dispatch(fn, args, argsPtr));
     } else if (mod === "wasi_snapshot_preview1" && wasiBridges[field]) {
       const handler = wasiBridges[field];
-      bridgeFunctions.set(i, (args) => handler(args));
+      bridgeFunctions.set(i, (args) => {
+        const r = handler(args);
+        return typeof r === "bigint" ? r : BigInt(r ?? 0);
+      });
     } else {
-      bridgeFunctions.set(i, () => 0n);
+      // Unknown import — fail loudly (ENOSYS) so the guest gets a real
+      // error instead of looping on uninitialised output pointers, which
+      // is what the old `() => 0n` fallback did.
+      const unknownName = `${mod}.${field}`;
+      bridgeFunctions.set(i, () => {
+        if (!wasiBridges.__warned) wasiBridges.__warned = new Set();
+        if (!wasiBridges.__warned.has(unknownName)) {
+          wasiBridges.__warned.add(unknownName);
+          console.warn(`[wasmkernel] unhandled guest import: ${unknownName} — returning ENOSYS`);
+        }
+        return WASI_ENOSYS;
+      });
     }
   }
 

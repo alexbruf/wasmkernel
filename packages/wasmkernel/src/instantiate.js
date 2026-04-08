@@ -13,6 +13,7 @@
  *   beforeInit({instance}), reuseWorker.
  */
 import { NapiRuntime } from "./napi_runtime.js";
+import { defaultWasiBridges, WASI_ENOSYS } from "./wasi_bridge.js";
 
 /** @param {Uint8Array} kernelBytes
  *  @param {Uint8Array} guestBytes
@@ -84,31 +85,11 @@ export async function instantiateNapiModule(kernelBytes, guestBytes, opts = {}) 
 
   const napiRuntime = new NapiRuntime(k);
 
-  // WASI host-bridge defaults. The kernel ships stubs for most wasi
-  // imports; we only override what the typical napi-rs addon actually
-  // calls from its Rust runtime. Callers can add more via opts.wasiBridges.
+  // Full empty-VFS WASI bridge for the GUEST's wasi_snapshot_preview1
+  // imports. Callers override individual functions via opts.wasiBridges
+  // to plug in real filesystems / stdin / etc.
   const wasiBridges = {
-    random_get(args) {
-      const [bufPtr, bufLen] = args;
-      const base = k.kernel_guest_memory_base();
-      const mem = new Uint8Array(k.memory.buffer);
-      // Use crypto-quality random if available.
-      if (typeof globalThis.crypto?.getRandomValues === "function") {
-        const chunk = new Uint8Array(Math.min(bufLen, 65536));
-        let remaining = bufLen, off = 0;
-        while (remaining > 0) {
-          const n = Math.min(chunk.length, remaining);
-          globalThis.crypto.getRandomValues(chunk.subarray(0, n));
-          mem.set(chunk.subarray(0, n), base + bufPtr + off);
-          off += n; remaining -= n;
-        }
-      } else {
-        // Fallback for environments without crypto.
-        for (let i = 0; i < bufLen; i++)
-          mem[base + bufPtr + i] = (Math.random() * 256) | 0;
-      }
-      return 0n;
-    },
+    ...defaultWasiBridges(() => k),
     ...(opts.wasiBridges || {}),
   };
 
@@ -132,9 +113,23 @@ export async function instantiateNapiModule(kernelBytes, guestBytes, opts = {}) 
       bridgeFunctions.set(i, (args, argsPtr) => napiRuntime.dispatch(fn, args, argsPtr));
     } else if (mod === "wasi_snapshot_preview1" && wasiBridges[field]) {
       const handler = wasiBridges[field];
-      bridgeFunctions.set(i, (args) => handler(args));
+      bridgeFunctions.set(i, (args) => {
+        const r = handler(args);
+        return typeof r === "bigint" ? r : BigInt(r ?? 0);
+      });
     } else {
-      bridgeFunctions.set(i, () => 0n);
+      // Unknown guest import — fail loudly with ENOSYS instead of the
+      // old silent-0n fallback, which caused hangs when Rust code read
+      // uninitialised output pointers back.
+      const unknownName = `${mod}.${field}`;
+      bridgeFunctions.set(i, () => {
+        if (!wasiBridges.__warned) wasiBridges.__warned = new Set();
+        if (!wasiBridges.__warned.has(unknownName)) {
+          wasiBridges.__warned.add(unknownName);
+          console.warn(`[wasmkernel] unhandled guest import: ${unknownName} — returning ENOSYS`);
+        }
+        return WASI_ENOSYS;
+      });
     }
   }
 
@@ -268,25 +263,7 @@ function instantiateNapiModuleNodeSync(kernelModule, kernelBytes, guestBytes, op
   const napiRuntime = new NapiRuntime(k);
 
   const wasiBridges = {
-    random_get(args) {
-      const [bufPtr, bufLen] = args;
-      const base = k.kernel_guest_memory_base();
-      const mem = new Uint8Array(k.memory.buffer);
-      if (typeof globalThis.crypto?.getRandomValues === "function") {
-        const chunk = new Uint8Array(Math.min(bufLen, 65536));
-        let remaining = bufLen, off = 0;
-        while (remaining > 0) {
-          const n = Math.min(chunk.length, remaining);
-          globalThis.crypto.getRandomValues(chunk.subarray(0, n));
-          mem.set(chunk.subarray(0, n), base + bufPtr + off);
-          off += n; remaining -= n;
-        }
-      } else {
-        for (let i = 0; i < bufLen; i++)
-          mem[base + bufPtr + i] = (Math.random() * 256) | 0;
-      }
-      return 0n;
-    },
+    ...defaultWasiBridges(() => k),
     ...(opts.wasiBridges || {}),
   };
 
@@ -309,9 +286,20 @@ function instantiateNapiModuleNodeSync(kernelModule, kernelBytes, guestBytes, op
       bridgeFunctions.set(i, (args, argsPtr) => napiRuntime.dispatch(fn, args, argsPtr));
     } else if (mod === "wasi_snapshot_preview1" && wasiBridges[field]) {
       const handler = wasiBridges[field];
-      bridgeFunctions.set(i, (args) => handler(args));
+      bridgeFunctions.set(i, (args) => {
+        const r = handler(args);
+        return typeof r === "bigint" ? r : BigInt(r ?? 0);
+      });
     } else {
-      bridgeFunctions.set(i, () => 0n);
+      const unknownName = `${mod}.${field}`;
+      bridgeFunctions.set(i, () => {
+        if (!wasiBridges.__warned) wasiBridges.__warned = new Set();
+        if (!wasiBridges.__warned.has(unknownName)) {
+          wasiBridges.__warned.add(unknownName);
+          console.warn(`[wasmkernel] unhandled guest import: ${unknownName} — returning ENOSYS`);
+        }
+        return WASI_ENOSYS;
+      });
     }
   }
 
