@@ -26,8 +26,13 @@ const fullDescribe = QUICK ? describe.skip : describe;
 // test rather than fail. CI deliberately does not populate them.
 const HAS_EMNAPI_SRC = existsSync("/tmp/emnapi-repo/packages/test");
 const HAS_TW_OXIDE = existsSync("/tmp/tw-oxide/package/tailwindcss-oxide.wasm32-wasi.wasm");
+const HAS_ROLLDOWN = existsSync(
+  resolve(import.meta.dir, "..", "tests", "pkgs", "rolldown", "package",
+          "rolldown-binding.wasm32-wasi.wasm")
+);
 const describeIfEmnapi = HAS_EMNAPI_SRC ? fullDescribe : describe.skip;
 const describeIfOxide = HAS_TW_OXIDE ? describe : describe.skip;
+const describeIfRolldown = HAS_ROLLDOWN ? describe : describe.skip;
 
 // `process.env.CI=true` is set automatically by GitHub Actions. Some
 // concurrency / timing tests reliably pass on dev machines but flake on
@@ -69,12 +74,14 @@ describe("Phase 1: build", () => {
     expect(stat.size).toBeGreaterThan(0);
   });
 
-  test("binary size under 400KB", () => {
+  test("binary size under 460KB", () => {
     const stat = statSync(KERNEL_PATH);
     // wasm-opt -Oz + asyncify + strip-debug + strip-producers gets us
-    // around 300 KB. 400 KB is the regression budget — if it goes over,
-    // something probably regressed in CMakeLists.txt's POST_BUILD step.
-    expect(stat.size).toBeLessThan(400 * 1024);
+    // around 300 KB without SIMD; enabling WAMR_BUILD_SIMD (needed to
+    // load rolldown's binding) adds ~30 KB for SIMDe. 460 KB is the
+    // regression budget — if it goes over, something probably regressed
+    // in CMakeLists.txt's POST_BUILD step.
+    expect(stat.size).toBeLessThan(460 * 1024);
   });
 });
 
@@ -277,6 +284,18 @@ describe("Phase 5: N-API compliance", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("30 passed, 0 failed");
   });
+
+  // Regression: rolldown-async hang. Worker threads call
+  // napi_resolve_deferred while the JS Promise is `await`ed, but no
+  // host code drives the cooperative scheduler in between. The napi
+  // runtime's promise-pump fixes this by stepping the kernel as long
+  // as a guest-created Promise is outstanding. See
+  // wasmkernel-issue-rolldown-async.md for the original repro.
+  test("napi Promise resolved from worker thread — rolldown-async repro", () => {
+    const result = runNodeTest("tests/host/test_napi_async_promise.mjs");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("2 passed, 0 failed");
+  }, 30000);
 });
 
 describeIfOxide("Phase 5: Oxide integration", () => {
@@ -327,6 +346,21 @@ describe("Phase 5: real napi-rs package — oxc-parser", () => {
     const result = runNodeTest("tests/host/test_oxc_parser.mjs");
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("6 passed, 0 failed");
+  }, 60000);
+});
+
+// Direct regression check for the rolldown-async hang
+// (wasmkernel-issue-rolldown-async.md). Loads the published
+// @rolldown/binding-wasm32-wasi via the wasmkernel CJS drop-in and
+// awaits transform() — which spawns a tokio task and resolves a
+// Deferred via TSFN, the exact pattern that hung pre-fix. Wasm is
+// ~12MB and fetched on-demand by scripts/install-rolldown.sh, so the
+// suite skips when the binding isn't present.
+describeIfRolldown("Phase 5: real napi-rs package — rolldown", () => {
+  test("rolldown binding loads + async transform() resolves", () => {
+    const result = runNodeTest("tests/host/test_rolldown.mjs");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("3 passed, 0 failed");
   }, 60000);
 });
 

@@ -2198,6 +2198,14 @@ export class NapiRuntime {
     this._writeU32(deferredPtr, deferredGuestPtr);
     const h = this._newHandle(promise);
     this._writeResult(resultPtr, h);
+    // Drive the cooperative scheduler until the promise settles.
+    // Without this, a guest that resolves the deferred from a worker
+    // thread (e.g. tokio task on wasi-thread-spawn) never makes progress
+    // because nothing else calls kernel_step after the JS function that
+    // created the promise returns. Refcount via _outstandingPromises so a
+    // single pump covers any number of in-flight deferreds.
+    this._beginPromisePump();
+    promise.then(() => this._endPromisePump(), () => this._endPromisePump());
     return napi_ok;
   }
 
@@ -2917,8 +2925,8 @@ export class NapiRuntime {
       return BigInt(napi_invalid_arg);
     }
     const method = this[funcName];
+    let result;
     if (method) {
-      let result;
       try {
         result = method.call(this, args);
       } catch (e) {
@@ -2931,10 +2939,62 @@ export class NapiRuntime {
       if (this.debug) {
         console.error(`  napi: ${funcName}(${args.join(',')}) -> ${result}`);
       }
-      return BigInt(result);
+    } else {
+      console.error(`napi: unimplemented ${funcName}`);
+      this._lastStatus = napi_generic_failure;
+      result = napi_generic_failure;
     }
-    console.error(`napi: unimplemented ${funcName}`);
-    this._lastStatus = napi_generic_failure;
-    return BigInt(napi_generic_failure);
+    // Drain async work + threadsafe-function queues that may have been
+    // populated by this call (or by a worker thread that ran during it).
+    // Without draining here, a tokio task that calls TSFN to resolve a
+    // Deferred enqueues the resolution but no other code path picks it
+    // up — kernel_step doesn't drain, kernel_call_indirect doesn't
+    // drain, and the host has nothing to call after the guest returns.
+    // Folded in from the user-side dispatch monkey-patch documented in
+    // wasmkernel-issue-rolldown-async.md.
+    if (this._pendingAsyncQueue?.length > 0) this.drainAsyncQueue();
+    if (this.hasPendingTsfn?.()) this.drainTsfnQueue();
+    return BigInt(result);
+  }
+
+  // ===== Promise pump: drive the cooperative scheduler while a guest
+  // Promise is outstanding. Calls kernel_step in bounded slices via
+  // setImmediate so JS microtasks (await continuations) interleave with
+  // worker progress. Stops as soon as no guest-created Promise is alive.
+  _beginPromisePump() {
+    this._outstandingPromises = (this._outstandingPromises || 0) + 1;
+    if (this._pumpScheduled) return;
+    this._pumpScheduled = true;
+    const schedule = (typeof setImmediate === 'function')
+      ? setImmediate
+      : (cb) => Promise.resolve().then(cb);
+    const pump = () => {
+      if (!this._outstandingPromises) {
+        this._pumpScheduled = false;
+        return;
+      }
+      // Bounded scheduler slice: each pump tick runs up to N kernel_step
+      // calls. The cap keeps the JS event loop responsive (timers, I/O,
+      // microtasks all get a chance between ticks).
+      let s = 0, iters = 0;
+      const MAX_STEPS_PER_TICK = 64;
+      while (s === 0 && iters++ < MAX_STEPS_PER_TICK) {
+        try { s = this.k.kernel_step ? this.k.kernel_step() : 1; }
+        catch { s = -1; break; }
+      }
+      // Drain queues that may have been populated during the steps. The
+      // dispatch path also drains, but workers can complete work without
+      // re-entering NAPI (e.g. just writing to shared memory), and we
+      // want any host-visible side-effects flushed before yielding.
+      if (this._postedFinalizersPending) this._drainFinalizers();
+      if (this._pendingAsyncQueue?.length > 0) this.drainAsyncQueue();
+      if (this.hasPendingTsfn?.()) this.drainTsfnQueue();
+      schedule(pump);
+    };
+    schedule(pump);
+  }
+
+  _endPromisePump() {
+    if (this._outstandingPromises) this._outstandingPromises--;
   }
 }

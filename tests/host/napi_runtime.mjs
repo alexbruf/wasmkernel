@@ -2189,6 +2189,10 @@ export class NapiRuntime {
     this._writeU32(deferredPtr, deferredGuestPtr);
     const h = this._newHandle(promise);
     this._writeResult(resultPtr, h);
+    // Drive the cooperative scheduler until the promise settles. See
+    // packages/wasmkernel/src/napi_runtime.js for the full rationale.
+    this._beginPromisePump();
+    promise.then(() => this._endPromisePump(), () => this._endPromisePump());
     return napi_ok;
   }
 
@@ -2902,8 +2906,8 @@ export class NapiRuntime {
       return BigInt(napi_invalid_arg);
     }
     const method = this[funcName];
+    let result;
     if (method) {
-      let result;
       try {
         result = method.call(this, args);
       } catch (e) {
@@ -2916,10 +2920,46 @@ export class NapiRuntime {
       if (this.debug) {
         console.error(`  napi: ${funcName}(${args.join(',')}) -> ${result}`);
       }
-      return BigInt(result);
+    } else {
+      console.error(`napi: unimplemented ${funcName}`);
+      this._lastStatus = napi_generic_failure;
+      result = napi_generic_failure;
     }
-    console.error(`napi: unimplemented ${funcName}`);
-    this._lastStatus = napi_generic_failure;
-    return BigInt(napi_generic_failure);
+    // Drain async work + threadsafe-function queues populated by this
+    // call (or by a worker that ran during it). See package runtime for
+    // full rationale.
+    if (this._pendingAsyncQueue?.length > 0) this.drainAsyncQueue();
+    if (this.hasPendingTsfn?.()) this.drainTsfnQueue();
+    return BigInt(result);
+  }
+
+  _beginPromisePump() {
+    this._outstandingPromises = (this._outstandingPromises || 0) + 1;
+    if (this._pumpScheduled) return;
+    this._pumpScheduled = true;
+    const schedule = (typeof setImmediate === 'function')
+      ? setImmediate
+      : (cb) => Promise.resolve().then(cb);
+    const pump = () => {
+      if (!this._outstandingPromises) {
+        this._pumpScheduled = false;
+        return;
+      }
+      let s = 0, iters = 0;
+      const MAX_STEPS_PER_TICK = 64;
+      while (s === 0 && iters++ < MAX_STEPS_PER_TICK) {
+        try { s = this.k.kernel_step ? this.k.kernel_step() : 1; }
+        catch { s = -1; break; }
+      }
+      if (this._postedFinalizersPending) this._drainFinalizers();
+      if (this._pendingAsyncQueue?.length > 0) this.drainAsyncQueue();
+      if (this.hasPendingTsfn?.()) this.drainTsfnQueue();
+      schedule(pump);
+    };
+    schedule(pump);
+  }
+
+  _endPromisePump() {
+    if (this._outstandingPromises) this._outstandingPromises--;
   }
 }

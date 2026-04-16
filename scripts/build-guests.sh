@@ -58,6 +58,22 @@ if [ -f tests/guest/asyncify_indirect.c ]; then
     echo "  asyncify_indirect.wasm"
 fi
 
+# Reactor + threads + napi imports — used by the rolldown-async hang
+# regression test. Worker thread resolves a Promise via napi while the
+# host awaits it.
+if [ -f tests/guest/napi_async_promise.c ]; then
+    "$CC" --target=wasm32-wasi-threads -O2 -mexec-model=reactor \
+        -matomics -mbulk-memory \
+        -Wl,--shared-memory,--import-memory,--export-memory,--max-memory=1048576 \
+        -Wl,--export=wasi_thread_start \
+        -Wl,--export=napi_register_wasm_v1 \
+        -Wl,--export-table \
+        -Wl,--allow-undefined \
+        tests/guest/napi_async_promise.c \
+        -o tests/guest/napi_async_promise.wasm
+    echo "  napi_async_promise.wasm"
+fi
+
 echo "=== WAMR wasi-threads test suite ==="
 WAMR_TEST_DIR="deps/wamr/core/iwasm/libraries/lib-wasi-threads/test"
 WAMR_SAMPLES="deps/wamr/samples/wasi-threads/wasm-apps"

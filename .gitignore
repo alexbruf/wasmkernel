@@ -13,6 +13,10 @@ dist/
 !tests/pkgs/**/*.wasm
 !tests/emnapi/wasm/*.wasm
 
+# Rolldown binding wasm is ~12MB — too big for git. Fetched on-demand
+# by scripts/install-rolldown.sh; the test skips when missing.
+tests/pkgs/rolldown/package/rolldown-binding.wasm32-wasi.wasm
+
 # Tracked guest C sources (the compiled .wasm output stays ignored —
 # CI rebuilds them via scripts/build-guests.sh)
 !tests/guest/*.c
