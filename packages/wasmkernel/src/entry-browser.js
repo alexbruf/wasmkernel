@@ -140,6 +140,17 @@ export async function instantiateNapiModule(guestBytes, options = {}) {
   const appHeap = options.appHeapSize ?? 0;
   if (k.kernel_set_app_heap_size) k.kernel_set_app_heap_size(appHeap);
 
+  // Opt-in: strip shared-memory flag so WAMR allocates only init_pages
+  // (not max_pages) and honors memory.grow. Required to run large napi
+  // guests like rolldown on CF Workers, where the 128 MB isolate cap
+  // would reject the shared-memory pre-allocation.
+  if (options.unshareMemory && k.kernel_set_unshare_memory) {
+    k.kernel_set_unshare_memory(1);
+  }
+  if (options.sharedMemMaxPages && k.kernel_set_shared_mem_max_pages) {
+    k.kernel_set_shared_mem_max_pages(options.sharedMemMaxPages);
+  }
+
   const pagedCfg = _setupPagedMemory(k, options);
 
   const ptr = k.kernel_alloc(guestBytes.length);

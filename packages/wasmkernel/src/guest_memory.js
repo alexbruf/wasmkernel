@@ -82,10 +82,16 @@ export class GuestMemory {
    *  stages cross-page scalar accesses in a scratch buffer that's only
    *  flushed at the next macro call or explicit flush. Host-side readers
    *  compute the physical address directly from the page table, so they
-   *  would see stale bytes in the hot window if we didn't flush here. */
+   *  would see stale bytes in the hot window if we didn't flush here.
+   *
+   *  WAMR may realloc guest memory_data when memory grows, which moves
+   *  the hot-window base to a new offset inside k.memory.buffer. We
+   *  re-fetch kernel_hot_window_base() on every access so the computed
+   *  phys address reflects the live layout. */
   _phys(guestAddr) {
     if (this.k.kernel_flush_cross_scratch)
       this.k.kernel_flush_cross_scratch();
+    this.hotBase = this.k.kernel_hot_window_base();
     const pg = guestAddr >>> 16;
     const po = guestAddr & 0xFFFF;
     const slot = this._slotFor(pg);
@@ -180,6 +186,7 @@ export class GuestMemory {
   readBytes(guestAddr, len) {
     if (this.k.kernel_flush_cross_scratch)
       this.k.kernel_flush_cross_scratch();
+    this.hotBase = this.k.kernel_hot_window_base();
     const out = new Uint8Array(len);
     let pos = 0;
     let addr = guestAddr >>> 0;
@@ -203,6 +210,7 @@ export class GuestMemory {
   writeBytes(guestAddr, bytes) {
     if (this.k.kernel_flush_cross_scratch)
       this.k.kernel_flush_cross_scratch();
+    this.hotBase = this.k.kernel_hot_window_base();
     const len = bytes.byteLength;
     let pos = 0;
     let addr = guestAddr >>> 0;
@@ -230,6 +238,7 @@ export class GuestMemory {
   readCString(guestAddr, maxLen = 16 * 1024 * 1024) {
     if (this.k.kernel_flush_cross_scratch)
       this.k.kernel_flush_cross_scratch();
+    this.hotBase = this.k.kernel_hot_window_base();
     // Scan page by page for NUL. For single-page strings (the common
     // case) this is a single buffer view.
     let end = guestAddr;

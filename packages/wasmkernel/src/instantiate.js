@@ -164,6 +164,13 @@ export async function instantiateNapiModule(kernelBytes, guestBytes, opts = {}) 
   const appHeap = opts.appHeapSize ?? 0;
   if (k.kernel_set_app_heap_size) k.kernel_set_app_heap_size(appHeap);
 
+  if (opts.unshareMemory && k.kernel_set_unshare_memory) {
+    k.kernel_set_unshare_memory(1);
+  }
+  if (opts.sharedMemMaxPages && k.kernel_set_shared_mem_max_pages) {
+    k.kernel_set_shared_mem_max_pages(opts.sharedMemMaxPages);
+  }
+
   // Configure paged memory (no-op if no backend / no hot-window-pages).
   const pagedCfg = _setupPagedMemory(k, bridgeFunctions, opts);
 
@@ -395,6 +402,13 @@ function instantiateNapiModuleNodeSync(kernelModule, kernelBytes, guestBytes, op
   const minInit = opts.minInitialPages ?? 4000;
   if (k.kernel_set_min_initial_pages && minInit > 0)
     k.kernel_set_min_initial_pages(minInit);
+
+  if (opts.unshareMemory && k.kernel_set_unshare_memory) {
+    k.kernel_set_unshare_memory(1);
+  }
+  if (opts.sharedMemMaxPages && k.kernel_set_shared_mem_max_pages) {
+    k.kernel_set_shared_mem_max_pages(opts.sharedMemMaxPages);
+  }
 
   const pagedCfg = _setupPagedMemory(k, bridgeFunctions, opts);
 

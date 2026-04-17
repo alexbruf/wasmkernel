@@ -31,7 +31,21 @@ static uint32_t g_min_initial_pages = 0;
  * for shared memories, so this directly caps kernel memory usage at
  * instantiate time. Default 1536 pages = 96 MB (fits under CF Workers'
  * 128 MB isolate cap with kernel/JS-heap overhead). */
-static uint32_t g_shared_mem_max_pages = 1280;
+/* Upper bound on max_page_count for shared memory. With our WAMR patch
+ * that lazily allocates shared memory (init_pages only), this is only a
+ * cap on memory.grow — NOT a pre-allocation. The guest grows its memory
+ * only as its allocator asks. Default matches the non-shared cap so
+ * Node/desktop runs aren't artificially throttled; CF Workers callers
+ * should call kernel_set_shared_mem_max_pages(2048) to stay within
+ * the 128 MB isolate cap. */
+static uint32_t g_shared_mem_max_pages = 8192;
+/* When true, strip SHARED_MEMORY_FLAG (0x02) from guest memory imports/
+ * declarations before instantiate. WAMR allocates only init_page_count
+ * for non-shared memory (vs max_page_count for shared), and honors
+ * memory.grow, so the guest's allocator can grow dynamically up to the
+ * full cap instead of being forced into a fixed preallocation.
+ * Single-threaded guests don't need shared semantics; threaded ones do. */
+static bool g_unshare_memory = false;
 
 /* Paged-memory hot window size, in 64 KB pages. 0 means "identity mapping"
  * (hot window == full guest memory, no paging). The host calls
@@ -776,6 +790,20 @@ kernel_load(uint32_t wasm_ptr, uint32_t wasm_len)
         }
     }
 
+    /* Optional: strip the shared flag from guest memories so WAMR
+     * allocates only init_page_count up front (instead of the full
+     * max_page_count pre-allocation shared memories force). The guest
+     * is then free to memory.grow as its allocator needs. */
+    if (g_unshare_memory) {
+        WASMModule *m = (WASMModule *)g_guest_module;
+        for (uint32_t i = 0; i < m->import_memory_count; i++) {
+            m->import_memories[i].u.memory.mem_type.flags &= ~0x02u;
+        }
+        for (uint32_t i = 0; i < m->memory_count; i++) {
+            m->memories[i].flags &= ~0x02u;
+        }
+    }
+
     /* Cap guest max memory on wasm32 — we can't allocate 4GB inside
        the kernel's own 4GB address space.
        For SHARED memories WAMR pre-allocates the full max_page_count,
@@ -1351,6 +1379,22 @@ void
 kernel_set_shared_mem_max_pages(uint32_t pages)
 {
     g_shared_mem_max_pages = pages ? pages : 1536u;
+}
+
+/* If true, strip the shared-memory flag from the guest's memory imports
+ * before kernel_load. WAMR then allocates init_page_count (not max) and
+ * allows memory.grow — letting the guest's allocator expand dynamically
+ * up to the declared max. Pass false to preserve shared semantics
+ * (required for guests that use threading / cross-thread atomics).
+ *
+ * Safe for single-threaded napi guests on CF Workers, where no real
+ * shared-memory semantics can be provided anyway (no SharedArrayBuffer
+ * access across isolates). */
+__attribute__((export_name("kernel_set_unshare_memory")))
+void
+kernel_set_unshare_memory(uint32_t enabled)
+{
+    g_unshare_memory = enabled != 0;
 }
 
 /* Register the bridge slot the host uses for page-fault handling.

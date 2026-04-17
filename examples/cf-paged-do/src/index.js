@@ -44,6 +44,12 @@ export class BundlerDO {
         memoryBackend: backend,
         hotWindowPages: 100,
         minInitialPages: 0,
+        // Cap shared-memory pre-allocation at 1280 pages (80 MB) so the
+        // kernel + JS heap + guest memory fit within CF Workers' 128 MB
+        // isolate cap. WAMR pre-allocates the full max for shared
+        // memories (required — see wasm_allocate_linear_memory), so the
+        // cap is a hard bound on what the guest allocator can consume.
+        sharedMemMaxPages: 1280,
       }
     );
     // Count resident pages post-load. If paging didn't activate we'd have
@@ -126,7 +132,8 @@ export class BundlerDO {
 
 export default {
   async fetch(request, env) {
-    const id = env.BUNDLER.idFromName("singleton");
+    // New singleton per deploy to avoid stale cached DO state.
+    const id = env.BUNDLER.idFromName("singleton-v6");
     return env.BUNDLER.get(id).fetch(request);
   },
 };

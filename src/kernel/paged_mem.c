@@ -429,17 +429,24 @@ paged_mem_on_grow(uint8_t *wamr_memory_data,
                   uint32_t old_pages, uint32_t new_pages)
 {
     (void)old_pages;
+    /* Flush any pending cross-page scratch so its writeback doesn't
+       land in the freed buffer. */
+    paged_mem_flush_cross_scratch();
     g_logical_pages = new_pages;
+    /* In both identity and paging-active modes, WAMR may have realloc'd
+       memory_data to a new address. Always refresh g_hot_base so every
+       subsequent slot_addr = g_hot_base + slot*64K + po resolves against
+       the live buffer. Slot contents were copied by realloc, so the
+       existing g_page_table mappings remain valid. */
+    g_hot_base = wamr_memory_data;
     if (!g_paging_active) {
-        /* Identity mode: WAMR reallocated memory_data, refresh base and
-           extend the identity table. */
-        g_hot_base = wamr_memory_data;
+        /* Identity mode: extend the identity table to cover new pages. */
         if (new_pages > PAGED_MEM_MAX_LOGICAL_PAGES)
             new_pages = PAGED_MEM_MAX_LOGICAL_PAGES;
         g_hot_window_pages = new_pages;
         for (uint32_t i = 0; i < new_pages; i++)
             g_page_table[i] = (uint16_t)i;
     }
-    /* Paging-active grow: hot window stays fixed. New logical pages start
-       un-resident; they'll fault in on first access. */
+    /* Paging-active grow: hot window stays the same physical size. New
+       logical pages start un-resident; they'll fault in on first access. */
 }
