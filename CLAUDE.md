@@ -85,7 +85,11 @@ Two platform decisions used to burn ~65 MB of RSS per kernel instance, both now 
 
 Together these drop RSS-at-load for a 1004-page guest (rolldown-equivalent) from ~65 MB to ~0.7 MB; the guest's logical memory is reserved in V8's address space but physical pages only commit as the guest touches them. See `tests/host/measure_rss.mjs` for the benchmark.
 
-**Note about CF's hard cap**: once a page is committed (guest wrote to it), V8 doesn't decommit on CF Workers — no `madvise(DONTNEED)` path available from JS. The slot-based paging system (`kernel_set_hot_window_pages` + `memoryBackend`) is therefore only useful when the guest's peak working set exceeds the 128 MB cap — paging lets cold pages live in SQLite and the hot window cycles. For guests whose working set fits in budget, the mmap + heap fixes above are sufficient.
+**CF 128 MB cap — current v0.1.9 limitation, NOT enforced**: once a page is committed (guest wrote to it), V8 doesn't decommit on CF Workers — no `madvise(DONTNEED)` path available from JS. The v0.1.9 paging system uses an **in-place swap model** (slot index == logical page; `g_hot_base == memory_data`); evictions zero the page in memory_data but CF V8 keeps it committed. Net effect: committed RSS on CF grows up to the guest's peak working set regardless of `hotWindowPages`. On Node (where V8 honours zero-writes via `MADV_FREE`), RSS actually drops as configured.
+
+**In short**: paging is correctness-complete everywhere but only RSS-effective on Node. On CF Workers, `hotWindowPages` is advisory — it controls how much memory must round-trip through the backend, not how much is physically resident.
+
+For CF to honour `hotWindowPages` as a hard RSS cap, slot cycling is required: slot ∈ `[0, hotWindowPages)`, cycling across logical pages so only that many physical pages of memory_data ever get written. An attempt at this landed a WAMR init-memory intercept + JS-side clock allocator but stalled on an unfound WAMR internal path that computes `memory_data + logical_offset` without going through the paged macro — oxc-parser trapped "out of bounds memory access" during napi register after only 3 faults (same failure mode as an earlier abandoned iteration). Not shipped. Future work would need deeper instrumentation of every `memory_data` deref site during guest execution.
 
 ## Remaining work for full NAPI-paged support
 
