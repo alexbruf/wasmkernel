@@ -104,6 +104,10 @@ export class BundlerDO {
           ok: true,
           loadMs,
           transformMs,
+          srcBytes: src.length,
+          codeLen: (result?.code ?? "").length,
+          errorCount: (result?.errors ?? []).length,
+          errorsFirst: (result?.errors ?? []).slice(0, 3),
           codePreview: (result?.code ?? "").slice(0, 200),
           resultKeys: Object.keys(result ?? {}),
         });

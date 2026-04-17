@@ -27,6 +27,11 @@ static bool g_initialized = false;
 
 /* See kernel_set_min_initial_pages comment below for what this does. */
 static uint32_t g_min_initial_pages = 0;
+/* Cap on shared-memory max_page_count. WAMR pre-allocates the FULL max
+ * for shared memories, so this directly caps kernel memory usage at
+ * instantiate time. Default 1536 pages = 96 MB (fits under CF Workers'
+ * 128 MB isolate cap with kernel/JS-heap overhead). */
+static uint32_t g_shared_mem_max_pages = 1280;
 
 /* Paged-memory hot window size, in 64 KB pages. 0 means "identity mapping"
  * (hot window == full guest memory, no paging). The host calls
@@ -772,15 +777,26 @@ kernel_load(uint32_t wasm_ptr, uint32_t wasm_len)
     }
 
     /* Cap guest max memory on wasm32 — we can't allocate 4GB inside
-       the kernel's own 4GB address space. 512MB is generous. */
+       the kernel's own 4GB address space.
+       For SHARED memories WAMR pre-allocates the full max_page_count,
+       so this cap directly governs how much memory the kernel tries to
+       malloc at instantiate time. On CF Workers the isolate is capped
+       at 128 MB, so we cap shared memories at 1536 pages (96 MB) to
+       leave room for kernel overhead, JS heap, etc.
+       Non-shared memories grow lazily so a higher cap is safe. */
     {
         WASMModule *m = (WASMModule *)g_guest_module;
-        uint32_t cap = 512 * 1024 * 1024 / 65536; /* 8192 pages = 512MB */
+        uint32_t shared_cap = g_shared_mem_max_pages;
+        uint32_t grow_cap = 8192u; /* 512 MB virtual for non-shared */
         for (uint32_t i = 0; i < m->import_memory_count; i++) {
+            bool shared = (m->import_memories[i].u.memory.mem_type.flags & 0x02) != 0;
+            uint32_t cap = shared ? shared_cap : grow_cap;
             if (m->import_memories[i].u.memory.mem_type.max_page_count > cap)
                 m->import_memories[i].u.memory.mem_type.max_page_count = cap;
         }
         for (uint32_t i = 0; i < m->memory_count; i++) {
+            bool shared = (m->memories[i].flags & 0x02) != 0;
+            uint32_t cap = shared ? shared_cap : grow_cap;
             if (m->memories[i].max_page_count > cap)
                 m->memories[i].max_page_count = cap;
         }
@@ -1322,6 +1338,21 @@ kernel_set_app_heap_size(uint32_t bytes)
     g_app_heap_size = bytes;
 }
 
+/* Set the cap for shared-memory max_page_count. WAMR pre-allocates the
+ * FULL max for shared memories at instantiate time, so on memory-capped
+ * environments (CF Workers: 128 MB isolate) this must be set low
+ * enough that the kernel's own heap + guest's shared memory fit.
+ *
+ * Call before kernel_load. Default 1536 pages (96 MB). Pass 0 to reset
+ * to the default. Values larger than the guest's declared max are
+ * harmless (the guest's own max wins). */
+__attribute__((export_name("kernel_set_shared_mem_max_pages")))
+void
+kernel_set_shared_mem_max_pages(uint32_t pages)
+{
+    g_shared_mem_max_pages = pages ? pages : 1536u;
+}
+
 /* Register the bridge slot the host uses for page-fault handling.
  * The host must have already added a bridge entry (module+field) for
  * that slot via the normal bridge registration path, so that the kernel's
@@ -1413,6 +1444,16 @@ void
 kernel_flush_cross_scratch(void)
 {
     paged_mem_flush_cross_scratch();
+}
+
+/* Expose the kernel's error buffer so JS callers can read the WAMR
+ * message from a failed kernel_load / kernel_call. Returns a pointer
+ * into kernel linear memory; the string is NUL-terminated. */
+__attribute__((export_name("kernel_last_error_ptr")))
+uint32_t
+kernel_last_error_ptr(void)
+{
+    return (uint32_t)(uintptr_t)g_error_buf;
 }
 
 /* Data-segment introspection: lets the host replay the guest's data

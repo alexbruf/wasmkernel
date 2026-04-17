@@ -170,8 +170,11 @@ export async function instantiateNapiModule(kernelBytes, guestBytes, opts = {}) 
   // Load the guest.
   const ptr = k.kernel_alloc(guestBytes.length);
   new Uint8Array(k.memory.buffer, ptr, guestBytes.length).set(guestBytes);
-  if (k.kernel_load(ptr, guestBytes.length) !== 0) {
-    throw new Error("wasmkernel: kernel_load failed");
+  {
+    const rc = k.kernel_load(ptr, guestBytes.length);
+    if (rc !== 0) {
+      throw new Error(`wasmkernel: kernel_load failed (rc=${rc})`);
+    }
   }
 
   // Complete paging wiring (constructs PageCache, registers bridge slot).
@@ -397,8 +400,11 @@ function instantiateNapiModuleNodeSync(kernelModule, kernelBytes, guestBytes, op
 
   const ptr = k.kernel_alloc(guestBytes.length);
   new Uint8Array(k.memory.buffer, ptr, guestBytes.length).set(guestBytes);
-  if (k.kernel_load(ptr, guestBytes.length) !== 0) {
-    throw new Error("wasmkernel: kernel_load failed");
+  {
+    const rc = k.kernel_load(ptr, guestBytes.length);
+    if (rc !== 0) {
+      throw new Error(`wasmkernel: kernel_load failed (rc=${rc})`);
+    }
   }
 
   const pageCache = _wirePagedMemoryAfterLoad(k, bridgeFunctions, pagedCfg);

@@ -144,8 +144,20 @@ export async function instantiateNapiModule(guestBytes, options = {}) {
 
   const ptr = k.kernel_alloc(guestBytes.length);
   new Uint8Array(k.memory.buffer, ptr, guestBytes.length).set(guestBytes);
-  if (k.kernel_load(ptr, guestBytes.length) !== 0) {
-    throw new Error("wasmkernel: kernel_load failed");
+  {
+    const rc = k.kernel_load(ptr, guestBytes.length);
+    if (rc !== 0) {
+      let msg = "";
+      if (k.kernel_last_error_ptr) {
+        const p = k.kernel_last_error_ptr();
+        const mem = new Uint8Array(k.memory.buffer, p, 256);
+        let end = 0;
+        while (end < mem.length && mem[end] !== 0) end++;
+        msg = new TextDecoder().decode(mem.subarray(0, end));
+      }
+      throw new Error(
+        `wasmkernel: kernel_load failed (rc=${rc}${msg ? `, msg="${msg}"` : ""})`);
+    }
   }
 
   const pageCache = _wirePagedMemoryAfterLoad(k, bridgeFunctions, pagedCfg);
