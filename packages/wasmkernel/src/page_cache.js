@@ -46,6 +46,12 @@ export class PageCache {
     // Scratch page buffer for backend I/O (reused).
     this.scratch = new Uint8Array(PAGE_SIZE);
     this._residentCount = 0;
+    // Per-page "ever faulted" bitmap. `uniqueTouchedPages` is an upper
+    // bound on committed RSS on platforms that don't decommit zero-written
+    // pages (CF Workers). Measured regardless of eviction — once a page
+    // is counted, it stays counted for the life of this cache.
+    this._everTouched = new Uint8Array(8192);
+    this.uniqueTouchedPages = 0;
   }
 
   /** Read the current hot-window base from the kernel. */
@@ -102,6 +108,11 @@ export class PageCache {
     // resident cap — evicts an LRU page to make room.
     if (process.env.PC_TRACE) {
       process.stderr.write(`[pc] fault-in page=${logicalPage}\n`);
+    }
+    if (logicalPage < this._everTouched.length
+        && !this._everTouched[logicalPage]) {
+      this._everTouched[logicalPage] = 1;
+      this.uniqueTouchedPages++;
     }
     const dst = this._slotView(logicalPage);
     this.backend.readPage(logicalPage, dst);

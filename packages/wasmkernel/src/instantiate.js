@@ -341,6 +341,7 @@ export async function instantiateNapiModule(kernelBytes, guestBytes, opts = {}) 
     // Expose internals for callers that need them
     kernel: k,
     napiRuntime,
+    pageCache,
   };
 }
 
@@ -524,6 +525,7 @@ function instantiateNapiModuleNodeSync(kernelModule, kernelBytes, guestBytes, op
     napiModule: { exports: napiExports },
     kernel: k,
     napiRuntime,
+    pageCache,
   };
 }
 
