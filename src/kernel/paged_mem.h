@@ -65,6 +65,24 @@ void paged_mem_set_page_fault_bridge_slot(uint32_t slot);
    we split, we reject. Very rare path (aligned wasm accesses ≤ 16 bytes). */
 uint8_t *paged_mem_cross_page(uint64_t offset, uint32_t bytes);
 
+/* Commit any pending cross-page scratch back to the logical pages.
+ * Called at the top of every CHECK_MEMORY_OVERFLOW macro and at host
+ * boundaries (wasm_runtime_addr_app_to_native, kernel_call_indirect
+ * entry/exit). Safe to call unconditionally. */
+void paged_mem_flush_cross_scratch(void);
+
+/* Paged-aware bulk memory operations. In identity mode these reduce to
+ * plain memcpy/memset. In slot-cycling mode they walk the pages and do
+ * per-page copies via the hot-window slots, faulting as needed, so they
+ * work even when the logical range spans non-consecutive physical slots.
+ * Return 0 on success, -1 on out-of-bounds (caller should raise the
+ * WAMR exception). */
+int paged_mem_bulk_copy_from_data(uint64_t dst_offset, const uint8_t *src,
+                                  uint64_t bytes);
+int paged_mem_bulk_fill(uint64_t dst_offset, uint8_t val, uint64_t bytes);
+int paged_mem_bulk_copy(uint64_t dst_offset, uint64_t src_offset,
+                        uint64_t bytes);
+
 /* Called by kernel_load after the guest module is instantiated.
    Sets up the page table and allocates the hot window.
    Until the host explicitly calls kernel_set_hot_window_pages(),

@@ -200,6 +200,10 @@ export function wasiPassthrough({ wasi }) {
       const iovInfo = IOV_ARGS[name];
 
       bridges[name] = (preParsedArgs, argsPtr) => {
+        // In paged mode the interpreter may have staged a cross-page
+        // scalar write in scratch; flush it before we read guest memory
+        // via direct pointer math below.
+        if (k.kernel_flush_cross_scratch) k.kernel_flush_cross_scratch();
         // Trust the kernel's pre-parsed low-32-bit values for every
         // slot; only upgrade to full-width reads for i64 slots that
         // the wasi function actually cares about.

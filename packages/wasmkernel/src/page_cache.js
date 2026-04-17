@@ -42,9 +42,14 @@ export class PageCache {
     // any byte in the cold region is not the 0x5A sentinel, some WAMR
     // path bypassed our macro — log once and continue (so we can see
     // how far the guest gets before crashing).
+    // Sentinel scan is opt-in: we don't actually fill 0x5A into the cold
+    // region (would clobber WAMR's pre-instantiate memory_data writes), so
+    // the scan is only meaningful when the caller also enables a sentinel
+    // fill. Left off by default to avoid spurious "expected 0x5A" reports.
     this._corruptionReported = false;
     this._scanOutPtr = 0;
-    if (typeof this.k.kernel_alloc === "function"
+    if (process.env.PC_COLD_SCAN
+        && typeof this.k.kernel_alloc === "function"
         && typeof this.k.kernel_scan_cold_region === "function") {
       this._scanOutPtr = this.k.kernel_alloc(1);
     }
@@ -142,6 +147,7 @@ export class PageCache {
       this.scratch.set(view);
       this.backend.writePage(victim, this.scratch);
       view.fill(0);
+      this.evictions = (this.evictions || 0) + 1;
     }
     // Load the faulting page into the slot.
     this.backend.readPage(logicalPage, view);

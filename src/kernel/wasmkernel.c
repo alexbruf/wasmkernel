@@ -1402,6 +1402,19 @@ kernel_ensure_page_resident(uint32_t logical_page)
     return paged_mem_fault(logical_page);
 }
 
+/* Commit any pending cross-page scalar scratch back to the guest's
+ * logical pages. The host must call this before reading/writing guest
+ * memory via the page-table math (GuestMemory's fast path) — otherwise
+ * a cross-page v128/i64 store staged in scratch would be invisible to
+ * the host read. Safe to call when paging isn't active (no-op). */
+extern void paged_mem_flush_cross_scratch(void);
+__attribute__((export_name("kernel_flush_cross_scratch")))
+void
+kernel_flush_cross_scratch(void)
+{
+    paged_mem_flush_cross_scratch();
+}
+
 /* Data-segment introspection: lets the host replay the guest's data
  * segments via its memory backend after instantiate, instead of WAMR
  * writing them directly into memory_data. Not wired yet — for the

@@ -75,8 +75,17 @@ export class GuestMemory {
   }
 
   /** Guest addr → physical offset inside k.memory.buffer.
-   *  Requires the containing page to be resident. */
+   *  Requires the containing page to be resident.
+   *
+   *  Before translating, commit any pending cross-page scratch back to
+   *  its logical pages. The interpreter's CHECK_MEMORY_OVERFLOW macro
+   *  stages cross-page scalar accesses in a scratch buffer that's only
+   *  flushed at the next macro call or explicit flush. Host-side readers
+   *  compute the physical address directly from the page table, so they
+   *  would see stale bytes in the hot window if we didn't flush here. */
   _phys(guestAddr) {
+    if (this.k.kernel_flush_cross_scratch)
+      this.k.kernel_flush_cross_scratch();
     const pg = guestAddr >>> 16;
     const po = guestAddr & 0xFFFF;
     const slot = this._slotFor(pg);
@@ -169,6 +178,8 @@ export class GuestMemory {
   /** Copies `len` bytes starting at guest address `guestAddr` into a
    *  fresh Uint8Array. Handles multi-page ranges by iterating. */
   readBytes(guestAddr, len) {
+    if (this.k.kernel_flush_cross_scratch)
+      this.k.kernel_flush_cross_scratch();
     const out = new Uint8Array(len);
     let pos = 0;
     let addr = guestAddr >>> 0;
@@ -190,6 +201,8 @@ export class GuestMemory {
   /** Writes `bytes` at guest address `guestAddr`. `bytes` is a
    *  Uint8Array. Iterates across page boundaries. */
   writeBytes(guestAddr, bytes) {
+    if (this.k.kernel_flush_cross_scratch)
+      this.k.kernel_flush_cross_scratch();
     const len = bytes.byteLength;
     let pos = 0;
     let addr = guestAddr >>> 0;
@@ -215,6 +228,8 @@ export class GuestMemory {
   /** Scan bytes starting at `guestAddr` until NUL, decode as UTF-8.
    *  `maxLen` caps the scan (default 16 MB). */
   readCString(guestAddr, maxLen = 16 * 1024 * 1024) {
+    if (this.k.kernel_flush_cross_scratch)
+      this.k.kernel_flush_cross_scratch();
     // Scan page by page for NUL. For single-page strings (the common
     // case) this is a single buffer view.
     let end = guestAddr;

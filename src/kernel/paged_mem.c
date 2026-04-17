@@ -183,38 +183,233 @@ paged_mem_fault(uint32_t logical_page)
     return slot;
 }
 
+/* Deferred-commit scratch for cross-page scalar accesses in slot-cycling
+ * mode. The macro doesn't know load vs store, so we:
+ *   1. Stage the current bytes from both logical pages into scratch.
+ *   2. Return the scratch address.
+ *   3. On the next paged memory-access macro (or an explicit flush),
+ *      write scratch back to the logical pages.
+ * If it was a load, the writeback is a no-op (same bytes back). If it
+ * was a store, the new value is committed.
+ *
+ * Max scalar access size in wasm is 16 bytes (v128). Scratch is 32B
+ * aligned so accesses don't straddle the scratch buffer internally. */
+#define PAGED_MEM_SCRATCH_SIZE 32u
+static uint8_t g_cross_scratch[PAGED_MEM_SCRATCH_SIZE]
+    __attribute__((aligned(16)));
+static uint64_t g_cross_offset;
+static uint32_t g_cross_bytes;
+static bool     g_cross_pending;
+
+/* Flush pending scratch back to logical pages. Called at the start of
+ * every CHECK_MEMORY_OVERFLOW and at interpreter exit / host boundary. */
+void
+paged_mem_flush_cross_scratch(void)
+{
+    if (!g_cross_pending) return;
+    uint64_t ofs = g_cross_offset;
+    uint32_t remaining = g_cross_bytes;
+    uint32_t src_off = 0;
+    /* Clear pending BEFORE the writes, so recursive calls from the
+     * fault handler don't re-enter the flush. */
+    g_cross_pending = false;
+    while (remaining > 0) {
+        uint32_t pg = (uint32_t)(ofs >> 16);
+        uint32_t po = (uint32_t)(ofs & 0xFFFFu);
+        uint32_t n = 65536u - po;
+        if (n > remaining) n = remaining;
+        uint16_t slot = g_page_table[pg];
+        if (slot == PAGED_MEM_INVALID_SLOT)
+            slot = (uint16_t)paged_mem_fault(pg);
+        memcpy(g_hot_base + ((uintptr_t)slot << 16) + po,
+               g_cross_scratch + src_off, n);
+        ofs += n;
+        src_off += n;
+        remaining -= n;
+    }
+}
+
 uint8_t *
 paged_mem_cross_page(uint64_t offset, uint32_t bytes)
 {
     /* Cross-page access spans 2+ logical pages. In identity mode, slot
        N == page N so pages are naturally contiguous in memory_data —
-       return the direct pointer.
-       In slot-cycling mode, logical pages live in scattered slots; the
-       access is contiguous in the guest's view but not in physical
-       memory. Fault in all pages covered, then check if the consecutive
-       slots happen to be physically consecutive (common for fresh
-       allocations before eviction starts). If not, return NULL so the
-       macro goes to out_of_bounds — the guest sees a trap instead of
-       silent corruption. */
+       return the direct pointer. */
     if (!g_paging_active) {
         return g_hot_base + offset;
     }
+    /* Commit any previously staged scratch before reusing it. */
+    paged_mem_flush_cross_scratch();
+
+    if (bytes > PAGED_MEM_SCRATCH_SIZE) {
+        /* Larger than our scratch (shouldn't happen for scalar ops —
+         * bulk ops route through paged_mem_bulk_* helpers instead). */
+        fprintf(stderr,
+                "paged_mem_cross_page: access too large for scratch "
+                "(ofs=0x%llx bytes=%u limit=%u) — returning OOB\n",
+                (unsigned long long)offset, bytes, PAGED_MEM_SCRATCH_SIZE);
+        return NULL;
+    }
+
     uint32_t pg0 = (uint32_t)(offset >> 16);
     uint32_t pg1 = (uint32_t)((offset + bytes - 1) >> 16);
+
+    /* Fault in every page covered by the access. */
     for (uint32_t p = pg0; p <= pg1; p++) {
-        if (g_page_table[p] == PAGED_MEM_INVALID_SLOT) {
+        if (g_page_table[p] == PAGED_MEM_INVALID_SLOT)
             (void)paged_mem_fault(p);
-        }
     }
-    /* Check all slots in the range are physically consecutive. */
-    uint16_t s0 = g_page_table[pg0];
-    for (uint32_t p = pg0 + 1, expected = s0 + 1; p <= pg1; p++, expected++) {
-        if ((uint32_t)g_page_table[p] != expected) {
-            return NULL;  /* non-contiguous; caller must trap */
-        }
+
+    /* Stage the logical bytes into scratch so loads read the right
+     * data. Stores will overwrite scratch; the flush commits the new
+     * value back to the logical pages. */
+    uint64_t ofs = offset;
+    uint32_t remaining = bytes;
+    uint32_t dst_off = 0;
+    while (remaining > 0) {
+        uint32_t pg = (uint32_t)(ofs >> 16);
+        uint32_t po = (uint32_t)(ofs & 0xFFFFu);
+        uint32_t n = 65536u - po;
+        if (n > remaining) n = remaining;
+        uint16_t slot = g_page_table[pg];
+        memcpy(g_cross_scratch + dst_off,
+               g_hot_base + ((uintptr_t)slot << 16) + po, n);
+        ofs += n;
+        dst_off += n;
+        remaining -= n;
     }
+
+    g_cross_offset = offset;
+    g_cross_bytes = bytes;
+    g_cross_pending = true;
+    return g_cross_scratch;
+}
+
+/* Translate a logical guest offset to a hot-window native pointer,
+ * faulting the page in if necessary. Used by the bulk helpers below.
+ * Returns NULL on out-of-bounds. */
+static uint8_t *
+_paged_xlate(uint64_t offset)
+{
+    uint32_t pg = (uint32_t)(offset >> 16);
     uint32_t po = (uint32_t)(offset & 0xFFFFu);
-    return g_hot_base + ((uintptr_t)s0 << 16) + po;
+    if (pg >= g_logical_pages) return NULL;
+    uint16_t slot = g_page_table[pg];
+    if (slot == PAGED_MEM_INVALID_SLOT)
+        slot = (uint16_t)paged_mem_fault(pg);
+    return g_hot_base + ((uintptr_t)slot << 16) + po;
+}
+
+int
+paged_mem_bulk_copy_from_data(uint64_t dst_offset, const uint8_t *src,
+                              uint64_t bytes)
+{
+    if (bytes == 0) return 0;
+    if (dst_offset + bytes > (uint64_t)g_logical_pages * 65536) return -1;
+    paged_mem_flush_cross_scratch();
+    if (!g_paging_active) {
+        memcpy(g_hot_base + dst_offset, src, (size_t)bytes);
+        return 0;
+    }
+    while (bytes > 0) {
+        uint32_t po = (uint32_t)(dst_offset & 0xFFFFu);
+        uint32_t room = 65536u - po;
+        uint32_t n = (bytes < room) ? (uint32_t)bytes : room;
+        uint8_t *dst = _paged_xlate(dst_offset);
+        if (!dst) return -1;
+        memcpy(dst, src, n);
+        src += n;
+        dst_offset += n;
+        bytes -= n;
+    }
+    return 0;
+}
+
+int
+paged_mem_bulk_fill(uint64_t dst_offset, uint8_t val, uint64_t bytes)
+{
+    if (bytes == 0) return 0;
+    if (dst_offset + bytes > (uint64_t)g_logical_pages * 65536) return -1;
+    paged_mem_flush_cross_scratch();
+    if (!g_paging_active) {
+        memset(g_hot_base + dst_offset, val, (size_t)bytes);
+        return 0;
+    }
+    while (bytes > 0) {
+        uint32_t po = (uint32_t)(dst_offset & 0xFFFFu);
+        uint32_t room = 65536u - po;
+        uint32_t n = (bytes < room) ? (uint32_t)bytes : room;
+        uint8_t *dst = _paged_xlate(dst_offset);
+        if (!dst) return -1;
+        memset(dst, val, n);
+        dst_offset += n;
+        bytes -= n;
+    }
+    return 0;
+}
+
+/* Scratch buffer for overlapping intra-page or across-page copy that
+ * needs to read before writing. A single 64K buffer is enough: we split
+ * at page boundaries and stage each page chunk through scratch. */
+static uint8_t g_bulk_scratch[65536];
+
+int
+paged_mem_bulk_copy(uint64_t dst_offset, uint64_t src_offset, uint64_t bytes)
+{
+    if (bytes == 0) return 0;
+    uint64_t mem_sz = (uint64_t)g_logical_pages * 65536;
+    if (dst_offset + bytes > mem_sz) return -1;
+    if (src_offset + bytes > mem_sz) return -1;
+    paged_mem_flush_cross_scratch();
+    if (!g_paging_active) {
+        memmove(g_hot_base + dst_offset, g_hot_base + src_offset, (size_t)bytes);
+        return 0;
+    }
+    /* Decide direction: if dst is ahead of src and they overlap, copy
+     * backwards so we don't clobber yet-to-be-read source bytes. */
+    int reverse = (dst_offset > src_offset
+                   && dst_offset < src_offset + bytes);
+    if (reverse) {
+        uint64_t s_end = src_offset + bytes;
+        uint64_t d_end = dst_offset + bytes;
+        while (bytes > 0) {
+            /* Max chunk: fits in one src page AND one dst page, working
+             * backwards from the end. */
+            uint32_t s_po = (uint32_t)((s_end - 1) & 0xFFFFu) + 1;
+            uint32_t d_po = (uint32_t)((d_end - 1) & 0xFFFFu) + 1;
+            uint32_t n = s_po < d_po ? s_po : d_po;
+            if ((uint64_t)n > bytes) n = (uint32_t)bytes;
+            uint8_t *src = _paged_xlate(s_end - n);
+            if (!src) return -1;
+            memcpy(g_bulk_scratch, src, n);
+            uint8_t *dst = _paged_xlate(d_end - n);
+            if (!dst) return -1;
+            memcpy(dst, g_bulk_scratch, n);
+            s_end -= n;
+            d_end -= n;
+            bytes -= n;
+        }
+    }
+    else {
+        while (bytes > 0) {
+            uint32_t s_po = (uint32_t)(src_offset & 0xFFFFu);
+            uint32_t d_po = (uint32_t)(dst_offset & 0xFFFFu);
+            uint32_t s_room = 65536u - s_po;
+            uint32_t d_room = 65536u - d_po;
+            uint32_t n = s_room < d_room ? s_room : d_room;
+            if ((uint64_t)n > bytes) n = (uint32_t)bytes;
+            uint8_t *src = _paged_xlate(src_offset);
+            if (!src) return -1;
+            memcpy(g_bulk_scratch, src, n);
+            uint8_t *dst = _paged_xlate(dst_offset);
+            if (!dst) return -1;
+            memcpy(dst, g_bulk_scratch, n);
+            src_offset += n;
+            dst_offset += n;
+            bytes -= n;
+        }
+    }
+    return 0;
 }
 
 void

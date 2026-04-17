@@ -102,12 +102,13 @@ async function run(label, extraOpts) {
 
   const touched = pageCache?.uniqueTouchedPages ?? 0;
   const touchedMB = (touched * 64 / 1024).toFixed(1);
+  const evictions = pageCache?.evictions ?? 0;
   console.log(
     `${label.padEnd(30)} ` +
     `src=${(src.length / 1024).toFixed(0)}KB ` +
     `out=${(outLen / 1024).toFixed(0)}KB${note} ` +
     `time=${Date.now() - t0}ms | ` +
-    `touched=${touched}p (~${touchedMB}MB) | ` +
+    `touched=${touched}p (~${touchedMB}MB) evict=${evictions} | ` +
     `after-run rss+${mb(afterRun.rss - base.rss)}MB`);
 }
 

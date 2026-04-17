@@ -31,6 +31,7 @@ extern bool     g_paging_active;
 
 uint32_t paged_mem_fault(uint32_t logical_page);
 uint8_t *paged_mem_cross_page(uint64_t offset, uint32_t bytes);
+void     paged_mem_flush_cross_scratch(void);
 
 /* Replace WAMR's macros. Both files' active branch is the
    !OS_ENABLE_HW_BOUND_CHECK / WASM_ENABLE_MEMORY64==0 variant (we have
@@ -58,6 +59,7 @@ uint8_t *paged_mem_cross_page(uint64_t offset, uint32_t bytes);
         if (g_hot_base == NULL) {                                              \
             maddr = memory->memory_data + _ofs;                                \
         } else {                                                               \
+            paged_mem_flush_cross_scratch();                                   \
             uint32_t _pg = (uint32_t)(_ofs >> 16);                             \
             uint32_t _po = (uint32_t)(_ofs & 0xFFFFu);                         \
             uint16_t _slot = g_page_table[_pg];                                \
@@ -81,6 +83,7 @@ uint8_t *paged_mem_cross_page(uint64_t offset, uint32_t bytes);
         if (g_hot_base == NULL) {                                              \
             (_maddr_out) = memory->memory_data + _ofs;                         \
         } else {                                                               \
+            paged_mem_flush_cross_scratch();                                   \
             uint32_t _pg = (uint32_t)(_ofs >> 16);                             \
             uint32_t _po = (uint32_t)(_ofs & 0xFFFFu);                         \
             uint16_t _slot = g_page_table[_pg];                                \
