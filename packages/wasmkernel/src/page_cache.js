@@ -35,7 +35,8 @@ export class PageCache {
 
     // Per-page "ever faulted" bitmap. uniqueTouchedPages is an upper
     // bound on committed RSS on platforms that don't decommit (CF).
-    this._everTouched = new Uint8Array(8192);
+    // Sized to match PAGED_MEM_MAX_LOGICAL_PAGES (32768 = 2 GB logical).
+    this._everTouched = new Uint8Array(32768);
     this.uniqueTouchedPages = 0;
 
     // Diagnostic: poll kernel_scan_cold_region after every fault. If

@@ -815,7 +815,7 @@ kernel_load(uint32_t wasm_ptr, uint32_t wasm_len)
     {
         WASMModule *m = (WASMModule *)g_guest_module;
         uint32_t shared_cap = g_shared_mem_max_pages;
-        uint32_t grow_cap = 8192u; /* 512 MB virtual for non-shared */
+        uint32_t grow_cap = 32768u; /* 2 GB virtual for non-shared */
         for (uint32_t i = 0; i < m->import_memory_count; i++) {
             bool shared = (m->import_memories[i].u.memory.mem_type.flags & 0x02) != 0;
             uint32_t cap = shared ? shared_cap : grow_cap;

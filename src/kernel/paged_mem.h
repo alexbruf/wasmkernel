@@ -30,7 +30,11 @@
 #include <stdbool.h>
 
 #define PAGED_MEM_INVALID_SLOT 0xFFFFu
-#define PAGED_MEM_MAX_LOGICAL_PAGES 8192u  /* 512 MB cap, matches kernel_load */
+/* 32768 pages = 2 GB. Covers the full wasm32 logical address space minus
+ * the top 2 GB (which wasi-libc rarely touches). If a guest grows past
+ * this, g_page_table accesses would go out of bounds — see
+ * paged_mem_on_grow where we clamp g_logical_pages to this value. */
+#define PAGED_MEM_MAX_LOGICAL_PAGES 32768u
 #define PAGED_MEM_MAX_HOT_SLOTS    4096u   /* 256 MB cap on hot window */
 
 /* Globals read inline by the paged CHECK_MEMORY_OVERFLOW macros. */
