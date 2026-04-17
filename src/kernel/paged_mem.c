@@ -75,31 +75,63 @@ paged_mem_on_instantiate(uint8_t *wamr_memory_data,
         return;
     }
 
-    /* In-place swap model: the "hot window" IS WAMR's memory_data. Slot
-     * index = logical page index (no remapping). The page table degenerates
-     * into a residency bitmap — g_page_table[i] is either i (resident) or
-     * INVALID (cold). Eviction zeros the page region in memory_data after
-     * flushing to backend; fault reads the page back from backend into its
-     * natural offset.
+    if (requested_hot_window_pages > PAGED_MEM_MAX_HOT_SLOTS)
+        requested_hot_window_pages = PAGED_MEM_MAX_HOT_SLOTS;
+
+    /* Slot-cycling mode. Slots 0..hot_window_pages-1 occupy the first
+     * `hot_window_pages * 64KB` bytes of memory_data. Cold pages live
+     * only in the backend. Evicting a slot reuses its physical bytes
+     * for a different logical page. Because writes only ever land in
+     * those first N physical pages, V8 only commits N pages regardless
+     * of the guest's logical working set.
      *
-     * This avoids the separate hot-window allocation — which required
-     * patching every WAMR code path that range-checks native pointers
-     * against [memory_data, memory_data_end). Keeping memory_data as the
-     * single source of truth means all those paths keep working without
-     * modification.
-     *
-     * RSS savings come from zeroing evicted pages so V8 can release them.
-     * On platforms where V8 doesn't decommit on write-zeros (some CF
-     * Workers configurations), RSS stays at peak working set; paging
-     * still enables correctness for guests whose logical memory exceeds
-     * the platform's reservation cap. */
+     * Cold region sentinel: fill memory_data[hot_window*64K..logical*64K)
+     * with 0x5A. If any WAMR code does `memory_data + logical_offset`
+     * bypassing our CHECK_MEMORY_OVERFLOW macro, it either reads 0x5A
+     * bytes (detectable as garbage in guest execution) or overwrites
+     * them (detectable via paged_mem_scan_cold_region). Critical for
+     * finding the long-tail of unpatched deref sites in WAMR. */
     g_paging_active = true;
     g_hot_base = wamr_memory_data;
-    g_hot_window_pages = initial_logical_pages;  /* not a cap; bookkeeping */
+    g_hot_window_pages = requested_hot_window_pages;
     for (uint32_t i = 0; i < PAGED_MEM_MAX_LOGICAL_PAGES; i++)
         g_page_table[i] = PAGED_MEM_INVALID_SLOT;
     for (uint32_t i = 0; i < PAGED_MEM_MAX_HOT_SLOTS; i++)
         g_slot_to_page[i] = 0xFFFFFFFFu;
+    /* No sentinel fill — cold region contents preserve whatever WAMR
+       wrote during instantiate (active data segments plus any
+       init-expr / start-fn memory writes). Host sparse-seeds those
+       bytes into the backend after on_instantiate so they survive
+       across subsequent paged faults. */
+}
+
+/* Scan the cold region of memory_data for bytes that differ from the
+ * 0x5A sentinel. Returns the first offending byte offset (relative to
+ * memory_data) or UINT64_MAX if clean. Called after every fault to
+ * surface bypass sites: if a WAMR path wrote bytes outside the hot
+ * window, this catches it immediately so the surrounding state is
+ * still meaningful for diagnosis.
+ *
+ * NOTE: this only detects WRITES to the cold region. Reads from the
+ * cold region produce 0x5A bytes but don't leave a trace — they show
+ * up as guest-side execution errors (like reading 0x5A5A5A5A as a
+ * pointer). The fault-path trace combined with the first-corruption
+ * offset is usually enough to triangulate the source. */
+
+uint64_t
+paged_mem_scan_cold_region(uint64_t *out_offset, uint8_t *out_byte)
+{
+    if (!g_paging_active) return 0xFFFFFFFFFFFFFFFFull;
+    uint64_t start = (uint64_t)g_hot_window_pages << 16;
+    uint64_t end = (uint64_t)g_logical_pages << 16;
+    for (uint64_t i = start; i < end; i++) {
+        if (g_hot_base[i] != 0x5A) {
+            if (out_offset) *out_offset = i;
+            if (out_byte) *out_byte = g_hot_base[i];
+            return i;
+        }
+    }
+    return 0xFFFFFFFFFFFFFFFFull;
 }
 
 uint32_t
@@ -132,9 +164,9 @@ paged_mem_fault(uint32_t logical_page)
     int64_t ret = host_func_call(g_page_fault_bridge_slot,
                                  (uint32_t)(uintptr_t)args_buf, 1);
     uint32_t slot = (uint32_t)ret;
-    if (slot >= PAGED_MEM_MAX_LOGICAL_PAGES) {
-        fprintf(stderr, "paged_mem_fault: host returned invalid slot %u\n",
-                slot);
+    if (slot >= g_hot_window_pages) {
+        fprintf(stderr, "paged_mem_fault: host returned invalid slot %u (hot_window=%u)\n",
+                slot, g_hot_window_pages);
         return 0;
     }
     /* Update bookkeeping from C to avoid JS→wasm re-entry while the
@@ -154,11 +186,19 @@ paged_mem_fault(uint32_t logical_page)
 uint8_t *
 paged_mem_cross_page(uint64_t offset, uint32_t bytes)
 {
-    /* In the in-place swap model, g_hot_base == memory_data and slot N
-       lives at memory_data + N*64KB. Logical pages are CONTIGUOUS in the
-       backing buffer, so a cross-page access is just a normal linear
-       read/write — but only if both pages are resident. Fault in both
-       pages, then return the natural contiguous pointer. */
+    /* Cross-page access spans 2+ logical pages. In identity mode, slot
+       N == page N so pages are naturally contiguous in memory_data —
+       return the direct pointer.
+       In slot-cycling mode, logical pages live in scattered slots; the
+       access is contiguous in the guest's view but not in physical
+       memory. Fault in all pages covered, then check if the consecutive
+       slots happen to be physically consecutive (common for fresh
+       allocations before eviction starts). If not, return NULL so the
+       macro goes to out_of_bounds — the guest sees a trap instead of
+       silent corruption. */
+    if (!g_paging_active) {
+        return g_hot_base + offset;
+    }
     uint32_t pg0 = (uint32_t)(offset >> 16);
     uint32_t pg1 = (uint32_t)((offset + bytes - 1) >> 16);
     for (uint32_t p = pg0; p <= pg1; p++) {
@@ -166,7 +206,15 @@ paged_mem_cross_page(uint64_t offset, uint32_t bytes)
             (void)paged_mem_fault(p);
         }
     }
-    return g_hot_base + offset;
+    /* Check all slots in the range are physically consecutive. */
+    uint16_t s0 = g_page_table[pg0];
+    for (uint32_t p = pg0 + 1, expected = s0 + 1; p <= pg1; p++, expected++) {
+        if ((uint32_t)g_page_table[p] != expected) {
+            return NULL;  /* non-contiguous; caller must trap */
+        }
+    }
+    uint32_t po = (uint32_t)(offset & 0xFFFFu);
+    return g_hot_base + ((uintptr_t)s0 << 16) + po;
 }
 
 void

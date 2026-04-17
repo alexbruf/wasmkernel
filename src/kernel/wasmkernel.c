@@ -1434,6 +1434,28 @@ kernel_memory_data_page_ptr(uint32_t page_idx)
     return (uint32_t)(uintptr_t)(m->memory_data + (uint64_t)page_idx * 65536u);
 }
 
+/* Diagnostic: scan the cold region of memory_data (pages beyond the
+   hot window) for bytes that differ from the 0x5A sentinel. Returns
+   the first corrupted byte's offset (relative to memory_data) or 0 if
+   clean. `out_byte_ptr` (if non-zero) receives the corrupted byte's
+   value at that offset — useful for fingerprinting the write.
+   In paged-cycling mode this is the primary diagnostic for finding
+   WAMR bypass sites — any non-sentinel byte in the cold region means
+   some WAMR code computed `memory_data + logical_offset` without going
+   through our CHECK_MEMORY_OVERFLOW macro and wrote directly. */
+extern uint64_t paged_mem_scan_cold_region(uint64_t *, uint8_t *);
+__attribute__((export_name("kernel_scan_cold_region")))
+uint32_t
+kernel_scan_cold_region(uint32_t out_byte_ptr)
+{
+    uint64_t ofs = 0;
+    uint8_t b = 0;
+    uint64_t r = paged_mem_scan_cold_region(&ofs, &b);
+    if (r == 0xFFFFFFFFFFFFFFFFull) return 0;
+    if (out_byte_ptr) *(uint8_t *)(uintptr_t)out_byte_ptr = b;
+    return (uint32_t)ofs;
+}
+
 /* ===== Bridge introspection exports ===== */
 /* Host calls these after kernel_load to discover bridge mappings */
 

@@ -57,12 +57,8 @@ function _wirePagedMemoryAfterLoad(k, bridgeFunctions, pagedCfg) {
     if (!srcPtr) continue;
     const view = new Uint8Array(k.memory.buffer, srcPtr, 65536);
     let hasData = false;
-    for (let off = 0; off < 65536; off += 4096) {
-      if (view[off] !== 0 || view[off + 1] !== 0
-          || view[off + 2] !== 0 || view[off + 3] !== 0) {
-        hasData = true;
-        break;
-      }
+    for (let off = 0; off < 65536; off += 64) {
+      if (view[off] !== 0) { hasData = true; break; }
     }
     if (!hasData) continue;
     scratch.set(view);

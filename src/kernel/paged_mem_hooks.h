@@ -63,7 +63,7 @@ uint8_t *paged_mem_cross_page(uint64_t offset, uint32_t bytes);
             uint16_t _slot = g_page_table[_pg];                                \
             if (_slot == 0xFFFFu)                                              \
                 _slot = (uint16_t)paged_mem_fault(_pg);                        \
-            if (g_paging_active && _po + (bytes) > 65536) {                                       \
+            if (g_paging_active && _po + (bytes) > 65536) {                    \
                 maddr = paged_mem_cross_page(_ofs, (uint32_t)(bytes));         \
                 if (!maddr) goto out_of_bounds;                                \
             } else {                                                           \

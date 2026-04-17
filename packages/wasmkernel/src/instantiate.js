@@ -68,28 +68,25 @@ function _wirePagedMemoryAfterLoad(k, bridgeFunctions, pagedCfg) {
   if (logicalPages > 0 && pagedCfg.backend.growPages(0) === 0) {
     pagedCfg.backend.growPages(logicalPages);
   }
-  // Seed the backend only with pages that have non-zero content (the
-  // guest's data segments). wasi-libc's bss + guest stack start zeroed;
-  // `backend.readPage` on missing pages zero-fills, so we don't need to
-  // store them. For a typical napi guest this reduces the in-memory
-  // backend's size from ~60 MB (all pages) to ~a few MB (actual data
-  // segments). For SQLite backends the savings are in storage rows.
+  // Sparse seed: copy each non-zero page of memory_data into the
+  // backend. This captures state WAMR wrote during instantiate — active
+  // data segments plus any wasm code that ran via init exprs or a
+  // start section. Without this, post-instantiate writes sitting in
+  // memory_data[logical_offset] would be invisible after paged-mode
+  // faults read zeros from an empty backend.
   const scratch = new Uint8Array(65536);
   for (let pg = 0; pg < logicalPages; pg++) {
     const srcPtr = k.kernel_memory_data_page_ptr(pg);
     if (!srcPtr) continue;
     const view = new Uint8Array(k.memory.buffer, srcPtr, 65536);
-    // Fast non-zero check: sample every 4 KB stride; if any sample is
-    // non-zero we assume the page needs seeding. False negatives only
-    // occur for pages whose non-zero bytes all happen to fall between
-    // 4KB-aligned offsets, which wasi-libc allocator layouts don't do.
+    // Tight stride: sample every 64 bytes. Sparse enough to be cheap
+    // (~1K samples/page) but dense enough to catch the small scattered
+    // writes WAMR's instantiate does (e.g., a few u32 scattered across
+    // a page). Previous 4KB stride missed these — broke paged mode for
+    // guests whose WAMR-writes-during-instantiate aren't at page-start.
     let hasData = false;
-    for (let off = 0; off < 65536; off += 4096) {
-      if (view[off] !== 0 || view[off + 1] !== 0
-          || view[off + 2] !== 0 || view[off + 3] !== 0) {
-        hasData = true;
-        break;
-      }
+    for (let off = 0; off < 65536; off += 64) {
+      if (view[off] !== 0) { hasData = true; break; }
     }
     if (!hasData) continue;
     scratch.set(view);
