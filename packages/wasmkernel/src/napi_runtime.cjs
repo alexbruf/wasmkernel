@@ -13,8 +13,19 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
+// GuestMemory is imported by napi_runtime.js; the CJS wrapper must
+// inline-require it and expose it to the evaluated source.
+const gmSrcPath = path.join(__dirname, 'guest_memory.js');
+let gmSrc = fs.readFileSync(gmSrcPath, 'utf8');
+// Strip ESM export keywords; inline the class + factory into scope.
+gmSrc = gmSrc
+  .replace(/^export class GuestMemory/m, 'class GuestMemory')
+  .replace(/^export function createIdentityGuestMemory/m, 'function createIdentityGuestMemory');
+
 const srcPath = path.join(__dirname, 'napi_runtime.js');
 let src = fs.readFileSync(srcPath, 'utf8');
+// Strip the ESM-only import of GuestMemory (already inlined above).
+src = src.replace(/^import\s+\{\s*GuestMemory\s*\}\s+from\s+["'][^"']+["'];?\s*$/m, '');
 // Strip the ESM-only `export` keyword on the class.
 src = src.replace(/^export class NapiRuntime/m, 'class NapiRuntime');
 
@@ -22,7 +33,7 @@ src = src.replace(/^export class NapiRuntime/m, 'class NapiRuntime');
 // controlled scope, and return the class at the end.
 // eslint-disable-next-line no-new-func
 const NapiRuntime = (new Function(
-  `"use strict"; ${src}; return NapiRuntime;`
+  `"use strict"; ${gmSrc}; ${src}; return NapiRuntime;`
 ))();
 
 module.exports = { NapiRuntime };

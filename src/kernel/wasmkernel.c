@@ -10,6 +10,7 @@
 #include "bh_platform.h"
 #include "wasm_export.h"
 #include "scheduler.h"
+#include "paged_mem.h"
 
 #include "wasm_exec_env.h"
 #include "wasm_suspend_flags.h"
@@ -26,6 +27,19 @@ static bool g_initialized = false;
 
 /* See kernel_set_min_initial_pages comment below for what this does. */
 static uint32_t g_min_initial_pages = 0;
+
+/* Paged-memory hot window size, in 64 KB pages. 0 means "identity mapping"
+ * (hot window == full guest memory, no paging). The host calls
+ * kernel_set_hot_window_pages() before kernel_load to opt into paging. */
+static uint32_t g_requested_hot_window_pages = 0;
+
+/* WAMR "app heap" size (bytes) — a region appended to linear memory for
+ * wasm_runtime_module_malloc. Default is 64 MB, which matches the pre-
+ * existing behavior but burns 64 MB of kernel linear memory even for
+ * guests that never use it. Hosts targeting CF Workers should call
+ * kernel_set_app_heap_size(0) before kernel_load to disable the heap
+ * and reclaim that 64 MB. */
+static uint32_t g_app_heap_size = 64 * 1024 * 1024;
 static wasm_module_t g_guest_module = NULL;
 static wasm_module_inst_t g_guest_instance = NULL;
 static wasm_exec_env_t g_guest_exec_env = NULL;
@@ -809,11 +823,27 @@ kernel_load(uint32_t wasm_ptr, uint32_t wasm_len)
         }
     }
     g_guest_instance = wasm_runtime_instantiate(g_guest_module,
-                                                 256 * 1024, 64 * 1024 * 1024,
+                                                 256 * 1024, g_app_heap_size,
                                                  g_error_buf, sizeof(g_error_buf));
     if (!g_guest_instance) {
         printf("kernel_load: %s\n", g_error_buf);
         return -3;
+    }
+
+    /* Initialize the paged memory layer. When g_requested_hot_window_pages
+     * is 0 or >= initial, we use identity mapping and behavior is unchanged.
+     * When smaller, we allocate a hot window and the WAMR interpreter macros
+     * in wasm_interp_*.c route through g_page_table + host_page_fault. */
+    {
+        wasm_memory_inst_t mem =
+            wasm_runtime_get_default_memory(g_guest_instance);
+        if (mem) {
+            uint8_t *memdata =
+                (uint8_t *)wasm_runtime_addr_app_to_native(g_guest_instance, 0);
+            uint32_t pages = wasm_memory_get_cur_page_count(mem);
+            paged_mem_on_instantiate(memdata, pages,
+                                     g_requested_hot_window_pages);
+        }
     }
 
     g_guest_exec_env = wasm_runtime_create_exec_env(g_guest_instance, 256 * 1024);
@@ -1257,6 +1287,151 @@ kernel_guest_memory_size(void)
     if (!mem) return 0;
     return wasm_memory_get_cur_page_count(mem)
            * wasm_memory_get_bytes_per_page(mem);
+}
+
+/* ===== Paged guest memory exports =====
+ * The host calls kernel_set_hot_window_pages(N) BEFORE kernel_load to
+ * opt into paging with an N-page (N * 64 KB) hot window. If N is 0 or
+ * >= the guest's initial logical page count, paging is a no-op (identity
+ * mapping) and guest behavior is unchanged.
+ *
+ * After kernel_load, the host:
+ *   - Reads kernel_hot_window_base/size to know where resident pages live
+ *   - Reads kernel_page_table_ptr to see/update the flat u16[] page table
+ *   - Provides a host_page_fault(page_idx) import that evicts a victim
+ *     if needed and returns the slot now holding that page
+ *
+ * The interpreter's CHECK_MEMORY_OVERFLOW macros read g_page_table and
+ * g_hot_base inline; only misses cross into the host. */
+
+__attribute__((export_name("kernel_set_hot_window_pages")))
+void
+kernel_set_hot_window_pages(uint32_t pages)
+{
+    g_requested_hot_window_pages = pages;
+}
+
+/* Set the size of the WAMR app-heap region appended to guest linear
+ * memory, in BYTES. Call before kernel_load. Default 64 MB. Pass 0
+ * when the guest doesn't use wasm_runtime_module_malloc (most napi
+ * guests, simple WASI programs). */
+__attribute__((export_name("kernel_set_app_heap_size")))
+void
+kernel_set_app_heap_size(uint32_t bytes)
+{
+    g_app_heap_size = bytes;
+}
+
+/* Register the bridge slot the host uses for page-fault handling.
+ * The host must have already added a bridge entry (module+field) for
+ * that slot via the normal bridge registration path, so that the kernel's
+ * host_func_call(slot, ...) dispatches correctly. 0 disables paging. */
+__attribute__((export_name("kernel_register_page_fault_slot")))
+void
+kernel_register_page_fault_slot(uint32_t slot)
+{
+    paged_mem_set_page_fault_bridge_slot(slot);
+}
+
+__attribute__((export_name("kernel_hot_window_base")))
+uint32_t
+kernel_hot_window_base(void)
+{
+    return g_hot_base ? (uint32_t)(uintptr_t)g_hot_base : 0;
+}
+
+__attribute__((export_name("kernel_hot_window_size")))
+uint32_t
+kernel_hot_window_size(void)
+{
+    return g_hot_window_pages * 65536u;
+}
+
+__attribute__((export_name("kernel_page_table_ptr")))
+uint32_t
+kernel_page_table_ptr(void)
+{
+    return (uint32_t)(uintptr_t)&g_page_table[0];
+}
+
+__attribute__((export_name("kernel_logical_page_count")))
+uint32_t
+kernel_logical_page_count(void)
+{
+    return g_logical_pages;
+}
+
+/* Update a single page table entry. Used by the host's page fault handler
+ * after it evicts a victim and installs the new page in the hot window. */
+__attribute__((export_name("kernel_page_table_set")))
+void
+kernel_page_table_set(uint32_t logical_page, uint32_t slot)
+{
+    if (logical_page >= PAGED_MEM_MAX_LOGICAL_PAGES)
+        return;
+    g_page_table[logical_page] =
+        (slot >= 0xFFFFu) ? 0xFFFFu : (uint16_t)slot;
+}
+
+/* Mark a logical page as not resident (without touching the slot).
+ * Host calls this during eviction. */
+__attribute__((export_name("kernel_page_table_clear")))
+void
+kernel_page_table_clear(uint32_t logical_page)
+{
+    if (logical_page >= PAGED_MEM_MAX_LOGICAL_PAGES)
+        return;
+    g_page_table[logical_page] = 0xFFFFu;
+}
+
+/* Called from the JS host-side bridge (via GuestMemory) when it needs
+ * to read/write a guest page and wants to ensure it's resident in the
+ * hot window first. Returns the slot index.
+ *
+ * Unlike paged_mem_fault (which is invoked by the interpreter mid-
+ * opcode), this entry point is reached via a normal JS→wasm call on
+ * a fresh stack, so it can safely trigger page faults and update
+ * kernel state without risking exec_env corruption. */
+__attribute__((export_name("kernel_ensure_page_resident")))
+uint32_t
+kernel_ensure_page_resident(uint32_t logical_page)
+{
+    if (logical_page >= PAGED_MEM_MAX_LOGICAL_PAGES) return 0xFFFFu;
+    uint16_t slot = g_page_table[logical_page];
+    if (slot != PAGED_MEM_INVALID_SLOT) return slot;
+    return paged_mem_fault(logical_page);
+}
+
+/* Data-segment introspection: lets the host replay the guest's data
+ * segments via its memory backend after instantiate, instead of WAMR
+ * writing them directly into memory_data. Not wired yet — for the
+ * identity-mapping path, WAMR's built-in init is fine. */
+__attribute__((export_name("kernel_data_segment_count")))
+uint32_t
+kernel_data_segment_count(void)
+{
+    if (!g_guest_module) return 0;
+    WASMModule *m = (WASMModule *)g_guest_module;
+    return m->data_seg_count;
+}
+
+/* Return a pointer (in kernel address space) to the N-th page of WAMR's
+ * original memory_data allocation. Used by the JS host, after kernel_load
+ * and before any guest execution, to seed its backend with the initial
+ * data-segment contents — so that subsequent page faults can be served
+ * from the backend instead of the (now-stale-once-writes-happen)
+ * memory_data. The host iterates [0, kernel_logical_page_count()) and
+ * calls backend.writePage with the bytes at this address. */
+__attribute__((export_name("kernel_memory_data_page_ptr")))
+uint32_t
+kernel_memory_data_page_ptr(uint32_t page_idx)
+{
+    if (!g_guest_instance) return 0;
+    wasm_memory_inst_t mem = wasm_runtime_get_default_memory(g_guest_instance);
+    if (!mem) return 0;
+    WASMMemoryInstance *m = (WASMMemoryInstance *)mem;
+    if (page_idx >= m->cur_page_count) return 0;
+    return (uint32_t)(uintptr_t)(m->memory_data + (uint64_t)page_idx * 65536u);
 }
 
 /* ===== Bridge introspection exports ===== */

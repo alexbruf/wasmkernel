@@ -62,6 +62,7 @@ add_executable(wasmkernel
     src/kernel/wasmkernel.c
     src/kernel/scheduler.c
     src/kernel/asyncify_stubs.c
+    src/kernel/paged_mem.c
     ${WAMR_RUNTIME_LIB_SOURCE}
 )
 
@@ -73,6 +74,11 @@ target_include_directories(wasmkernel PRIVATE
     ${CMAKE_SOURCE_DIR}/src/platform_wasi
     ${CMAKE_SOURCE_DIR}/src/kernel
 )
+
+# Paged guest memory is always-on. The WAMR interpreter sources consult
+# the WASMKERNEL_PAGED_MEMORY define to pull in src/kernel/paged_mem_hooks.h
+# after their macro definitions (see wasm_interp_classic.c / wasm_interp_fast.c).
+target_compile_definitions(wasmkernel PRIVATE WASMKERNEL_PAGED_MEMORY=1)
 
 # Reactor model: exports individual functions, no _start
 target_link_options(wasmkernel PRIVATE

@@ -15,6 +15,88 @@
 import { NapiRuntime } from "./napi_runtime.js";
 import { defaultWasiBridges, WASI_ENOSYS } from "./wasi_bridge.js";
 import { wasiPassthrough } from "./wasi_passthrough.js";
+import { PageCache } from "./page_cache.js";
+import { GuestMemory } from "./guest_memory.js";
+
+/** Bridge slot reserved for the paged-memory fault handler. Picked at
+ *  the top of MAX_BRIDGE_FUNCS (256 in wasmkernel.c) so it never clashes
+ *  with a guest import. The kernel doesn't use this slot for anything
+ *  until the host calls kernel_register_page_fault_slot. */
+const PAGE_FAULT_BRIDGE_SLOT = 255;
+
+/** Set up paged memory from options.
+ *  Returns { pageCache, active } — active=false means identity mode. */
+function _setupPagedMemory(k, bridgeFunctions, opts) {
+  if (!k.kernel_set_hot_window_pages) return { pageCache: null, active: false };
+  const backend = opts.memoryBackend ?? null;
+  const hotWindowPages = opts.hotWindowPages ?? 0;
+  // Paging only activates when the host provided BOTH a backend and a
+  // hot window smaller than the initial logical size. Without a backend
+  // we default to identity mode so existing callers are unaffected.
+  if (!backend || !hotWindowPages) return { pageCache: null, active: false };
+
+  k.kernel_set_hot_window_pages(hotWindowPages);
+  // Deferred: pageCache is constructed AFTER kernel_load because the
+  // hot window / page table globals are only valid after instantiate.
+  return {
+    pageCache: null,  // filled in by _wirePagedMemoryAfterLoad
+    active: true,
+    backend,
+    hotWindowPages,
+  };
+}
+
+/** Complete paged memory wiring after kernel_load.
+ *  Seeds the backend from memory_data so subsequent page faults return
+ *  the correct initial data-segment contents. */
+function _wirePagedMemoryAfterLoad(k, bridgeFunctions, pagedCfg) {
+  if (!pagedCfg.active) return null;
+  const pageCache = new PageCache(k, pagedCfg.backend, pagedCfg.hotWindowPages);
+  bridgeFunctions.set(PAGE_FAULT_BRIDGE_SLOT, (args) => {
+    const logicalPage = args[0] >>> 0;
+    const slot = pageCache.onPageFault(logicalPage);
+    return BigInt(slot);
+  });
+  k.kernel_register_page_fault_slot(PAGE_FAULT_BRIDGE_SLOT);
+
+  // Seed the backend with the guest's initial memory contents (from
+  // WAMR's memory_data allocation). After this, the backend is the
+  // source of truth for the guest's linear memory — memory_data is
+  // effectively dead, though still allocated. (A follow-up can prune
+  // memory_data once we confirm all reads route through the macro.)
+  const logicalPages = k.kernel_logical_page_count();
+  if (logicalPages > 0 && pagedCfg.backend.growPages(0) === 0) {
+    pagedCfg.backend.growPages(logicalPages);
+  }
+  // Seed the backend only with pages that have non-zero content (the
+  // guest's data segments). wasi-libc's bss + guest stack start zeroed;
+  // `backend.readPage` on missing pages zero-fills, so we don't need to
+  // store them. For a typical napi guest this reduces the in-memory
+  // backend's size from ~60 MB (all pages) to ~a few MB (actual data
+  // segments). For SQLite backends the savings are in storage rows.
+  const scratch = new Uint8Array(65536);
+  for (let pg = 0; pg < logicalPages; pg++) {
+    const srcPtr = k.kernel_memory_data_page_ptr(pg);
+    if (!srcPtr) continue;
+    const view = new Uint8Array(k.memory.buffer, srcPtr, 65536);
+    // Fast non-zero check: sample every 4 KB stride; if any sample is
+    // non-zero we assume the page needs seeding. False negatives only
+    // occur for pages whose non-zero bytes all happen to fall between
+    // 4KB-aligned offsets, which wasi-libc allocator layouts don't do.
+    let hasData = false;
+    for (let off = 0; off < 65536; off += 4096) {
+      if (view[off] !== 0 || view[off + 1] !== 0
+          || view[off + 2] !== 0 || view[off + 3] !== 0) {
+        hasData = true;
+        break;
+      }
+    }
+    if (!hasData) continue;
+    scratch.set(view);
+    pagedCfg.backend.writePage(pg, scratch);
+  }
+  return pageCache;
+}
 
 /** @param {Uint8Array} kernelBytes
  *  @param {Uint8Array} guestBytes
@@ -77,6 +159,17 @@ export async function instantiateNapiModule(kernelBytes, guestBytes, opts = {}) 
   if (k.kernel_set_min_initial_pages && minInit > 0)
     k.kernel_set_min_initial_pages(minInit);
 
+  // WAMR's app heap (for wasm_runtime_module_malloc) is 64 MB by default,
+  // which burns 64 MB of kernel linear memory per instance even for guests
+  // that never use it. Most napi guests use the wasi-libc allocator in
+  // their own declared memory, so defaulting to 0 here avoids the cost.
+  // Callers that DO need the WAMR heap can pass opts.appHeapSize.
+  const appHeap = opts.appHeapSize ?? 0;
+  if (k.kernel_set_app_heap_size) k.kernel_set_app_heap_size(appHeap);
+
+  // Configure paged memory (no-op if no backend / no hot-window-pages).
+  const pagedCfg = _setupPagedMemory(k, bridgeFunctions, opts);
+
   // Load the guest.
   const ptr = k.kernel_alloc(guestBytes.length);
   new Uint8Array(k.memory.buffer, ptr, guestBytes.length).set(guestBytes);
@@ -84,7 +177,15 @@ export async function instantiateNapiModule(kernelBytes, guestBytes, opts = {}) 
     throw new Error("wasmkernel: kernel_load failed");
   }
 
-  const napiRuntime = new NapiRuntime(k);
+  // Complete paging wiring (constructs PageCache, registers bridge slot).
+  const pageCache = _wirePagedMemoryAfterLoad(k, bridgeFunctions, pagedCfg);
+
+  // Build the guest-memory wrapper once and share it across NapiRuntime
+  // and the WASI bridge. It internally re-reads k.memory.buffer per op,
+  // so memory.grow is transparent.
+  const gm = new GuestMemory(k, pageCache);
+
+  const napiRuntime = new NapiRuntime(k, gm);
 
   // Build the guest-side WASI bridge table in three layers, last wins:
   //
@@ -111,7 +212,7 @@ export async function instantiateNapiModule(kernelBytes, guestBytes, opts = {}) 
       ? opts.wasiBridges(k)
       : (opts.wasiBridges || {});
   const wasiBridges = {
-    ...defaultWasiBridges(() => k),
+    ...defaultWasiBridges(() => k, () => gm),
     ...passthrough,
     ...userBridges,
   };
@@ -294,13 +395,18 @@ function instantiateNapiModuleNodeSync(kernelModule, kernelBytes, guestBytes, op
   if (k.kernel_set_min_initial_pages && minInit > 0)
     k.kernel_set_min_initial_pages(minInit);
 
+  const pagedCfg = _setupPagedMemory(k, bridgeFunctions, opts);
+
   const ptr = k.kernel_alloc(guestBytes.length);
   new Uint8Array(k.memory.buffer, ptr, guestBytes.length).set(guestBytes);
   if (k.kernel_load(ptr, guestBytes.length) !== 0) {
     throw new Error("wasmkernel: kernel_load failed");
   }
 
-  const napiRuntime = new NapiRuntime(k);
+  const pageCache = _wirePagedMemoryAfterLoad(k, bridgeFunctions, pagedCfg);
+
+  const gm = new GuestMemory(k, pageCache);
+  const napiRuntime = new NapiRuntime(k, gm);
 
   // Three-layer wasi bridge (see async path for the full explanation):
   //   1. empty-VFS defaults
@@ -312,7 +418,7 @@ function instantiateNapiModuleNodeSync(kernelModule, kernelBytes, guestBytes, op
       ? opts.wasiBridges(k)
       : (opts.wasiBridges || {});
   const wasiBridges = {
-    ...defaultWasiBridges(() => k),
+    ...defaultWasiBridges(() => k, () => gm),
     ..._passthrough,
     ..._userBridges,
   };

@@ -1,0 +1,4 @@
+node_modules/
+.wrangler/
+bun.lock
+src/*.wasm.bin

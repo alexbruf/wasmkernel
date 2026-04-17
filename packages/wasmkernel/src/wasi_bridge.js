@@ -39,20 +39,27 @@ const PREOPEN_FD = 3;
 
 /**
  * Build the default bridge handlers. Takes a getter for the kernel
- * exports so we can access memory + guest_memory_base lazily (the memory
- * may grow between instantiation and first call, so we always re-read
- * the buffer).
+ * exports (so we can access memory lazily; memory.grow invalidates
+ * previous buffer views) and an optional GuestMemory — if omitted, a
+ * fresh identity-mode one is constructed.
  */
-export function defaultWasiBridges(getKernel) {
-  // Helpers that always read the current buffer (memory.grow invalidates
-  // previous DataView/Uint8Array instances).
-  const mem = () => new Uint8Array(getKernel().memory.buffer);
-  const dv = () => new DataView(getKernel().memory.buffer);
-  const base = () => getKernel().kernel_guest_memory_base();
+export function defaultWasiBridges(getKernel, getGuestMemory = null) {
+  // GuestMemory handles both identity and paged modes. All guest-memory
+  // reads/writes route through `gm()`; grow between calls is transparent
+  // because gm internally re-reads k.memory.buffer on every op.
+  const gm = () => {
+    if (getGuestMemory) return getGuestMemory();
+    // Fallback: identity-mode gm built on demand (no page cache).
+    // We lazy-require rather than importing at top to avoid an import
+    // cycle (napi_runtime imports wasi_bridge indirectly in some paths).
+    throw new Error(
+      "defaultWasiBridges: a GuestMemory getter is required. Pass the "
+      + "second arg or ensure instantiate.js has been updated.");
+  };
 
-  function writeU32(ptr, val) { dv().setUint32(base() + ptr, val >>> 0, true); }
-  function writeU64(ptr, val) { dv().setBigUint64(base() + ptr, BigInt(val), true); }
-  function writeBytes(ptr, bytes) { mem().set(bytes, base() + ptr); }
+  function writeU32(ptr, val) { gm().writeU32(ptr, val >>> 0); }
+  function writeU64(ptr, val) { gm().writeU64(ptr, BigInt(val)); }
+  function writeBytes(ptr, bytes) { gm().writeBytes(ptr, bytes); }
 
   // --- fd_write: route fd 1 → console.log, fd 2 → console.error ---
   const stdoutLines = ["", ""]; // index 0 unused, 1 = stdout buffer, 2 = stderr
@@ -64,13 +71,11 @@ export function defaultWasiBridges(getKernel) {
     }
     let total = 0;
     let text = "";
-    const gBase = base();
-    const d = dv();
-    const m = mem();
+    const g = gm();
     for (let i = 0; i < iovsLen; i++) {
-      const p = d.getUint32(gBase + iovsPtr + i * 8, true);
-      const len = d.getUint32(gBase + iovsPtr + i * 8 + 4, true);
-      text += new TextDecoder().decode(m.slice(gBase + p, gBase + p + len));
+      const p = g.readU32(iovsPtr + i * 8);
+      const len = g.readU32(iovsPtr + i * 8 + 4);
+      text += new TextDecoder().decode(g.readBytes(p, len));
       total += len;
     }
     writeU32(nwrittenPtr, total);
@@ -234,19 +239,20 @@ export function defaultWasiBridges(getKernel) {
   // --- random_get: crypto ---
   function random_get(args) {
     const [bufPtr, bufLen] = args;
-    const gBase = base();
-    const m = mem();
+    const g = gm();
     if (typeof globalThis.crypto?.getRandomValues === "function") {
       const chunk = new Uint8Array(Math.min(bufLen, 65536));
       let remaining = bufLen, off = 0;
       while (remaining > 0) {
         const n = Math.min(chunk.length, remaining);
         globalThis.crypto.getRandomValues(chunk.subarray(0, n));
-        m.set(chunk.subarray(0, n), gBase + bufPtr + off);
+        g.writeBytes(bufPtr + off, chunk.subarray(0, n));
         off += n; remaining -= n;
       }
     } else {
-      for (let i = 0; i < bufLen; i++) m[gBase + bufPtr + i] = (Math.random() * 256) | 0;
+      const bytes = new Uint8Array(bufLen);
+      for (let i = 0; i < bufLen; i++) bytes[i] = (Math.random() * 256) | 0;
+      g.writeBytes(bufPtr, bytes);
     }
     return WASI_ESUCCESS;
   }

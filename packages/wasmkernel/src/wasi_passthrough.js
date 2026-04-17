@@ -1,6 +1,16 @@
 /**
  * Guest-WASI passthrough bridge.
  *
+ * NOTE (paged memory): this module still computes physical addresses as
+ * `kernel_guest_memory_base() + guestPtr` because it needs to hand raw
+ * pointers to the host's wasi shim (node:wasi, etc.), which dereferences
+ * them directly against `k.memory.buffer`. That only works in identity
+ * mode (hot window == full guest memory); in paged mode, logical pages
+ * aren't contiguous at `guest_base + ptr`. For CF Workers, pass custom
+ * `wasiBridges` that route through GuestMemory (see defaultWasiBridges
+ * for the pattern) rather than wasi_passthrough.
+ *
+ *
  * Routes the guest wasm's `wasi_snapshot_preview1.*` imports through the
  * caller-supplied `options.wasi.wasiImport` implementation (node:wasi,
  * @bjorn3/browser_wasi_shim, @wasmer/wasi, or anything else that exposes

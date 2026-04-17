@@ -24,6 +24,52 @@
 import { NapiRuntime } from "./napi_runtime.js";
 import { defaultWasiBridges, WASI_ENOSYS } from "./wasi_bridge.js";
 import { wasiPassthrough } from "./wasi_passthrough.js";
+import { PageCache } from "./page_cache.js";
+import { GuestMemory } from "./guest_memory.js";
+
+const PAGE_FAULT_BRIDGE_SLOT = 255;
+
+function _setupPagedMemory(k, opts) {
+  if (!k.kernel_set_hot_window_pages) return { active: false };
+  const backend = opts.memoryBackend ?? null;
+  const hotWindowPages = opts.hotWindowPages ?? 0;
+  if (!backend || !hotWindowPages) return { active: false };
+  k.kernel_set_hot_window_pages(hotWindowPages);
+  return { active: true, backend, hotWindowPages };
+}
+
+function _wirePagedMemoryAfterLoad(k, bridgeFunctions, pagedCfg) {
+  if (!pagedCfg.active) return null;
+  const pageCache = new PageCache(k, pagedCfg.backend, pagedCfg.hotWindowPages);
+  bridgeFunctions.set(PAGE_FAULT_BRIDGE_SLOT, (args) => {
+    const logicalPage = args[0] >>> 0;
+    return BigInt(pageCache.onPageFault(logicalPage));
+  });
+  k.kernel_register_page_fault_slot(PAGE_FAULT_BRIDGE_SLOT);
+
+  const logicalPages = k.kernel_logical_page_count();
+  if (logicalPages > 0 && pagedCfg.backend.growPages(0) === 0) {
+    pagedCfg.backend.growPages(logicalPages);
+  }
+  const scratch = new Uint8Array(65536);
+  for (let pg = 0; pg < logicalPages; pg++) {
+    const srcPtr = k.kernel_memory_data_page_ptr(pg);
+    if (!srcPtr) continue;
+    const view = new Uint8Array(k.memory.buffer, srcPtr, 65536);
+    let hasData = false;
+    for (let off = 0; off < 65536; off += 4096) {
+      if (view[off] !== 0 || view[off + 1] !== 0
+          || view[off + 2] !== 0 || view[off + 3] !== 0) {
+        hasData = true;
+        break;
+      }
+    }
+    if (!hasData) continue;
+    scratch.set(view);
+    pagedCfg.backend.writePage(pg, scratch);
+  }
+  return pageCache;
+}
 
 /** Fetch and cache the kernel bytes. Resolved relative to this module.
  *  Used as a default when the caller doesn't supply their own kernel
@@ -95,13 +141,20 @@ export async function instantiateNapiModule(guestBytes, options = {}) {
   const minInit = options.minInitialPages ?? 4000;
   if (k.kernel_set_min_initial_pages && minInit > 0) k.kernel_set_min_initial_pages(minInit);
 
+  const appHeap = options.appHeapSize ?? 0;
+  if (k.kernel_set_app_heap_size) k.kernel_set_app_heap_size(appHeap);
+
+  const pagedCfg = _setupPagedMemory(k, options);
+
   const ptr = k.kernel_alloc(guestBytes.length);
   new Uint8Array(k.memory.buffer, ptr, guestBytes.length).set(guestBytes);
   if (k.kernel_load(ptr, guestBytes.length) !== 0) {
     throw new Error("wasmkernel: kernel_load failed");
   }
 
-  const napiRuntime = new NapiRuntime(k);
+  const pageCache = _wirePagedMemoryAfterLoad(k, bridgeFunctions, pagedCfg);
+  const gm = new GuestMemory(k, pageCache);
+  const napiRuntime = new NapiRuntime(k, gm);
 
   // Three-layer guest WASI bridge:
   //   1. empty-VFS defaults from wasi_bridge.js
@@ -116,7 +169,7 @@ export async function instantiateNapiModule(guestBytes, options = {}) {
       ? options.wasiBridges(k)
       : (options.wasiBridges || {});
   const wasiBridges = {
-    ...defaultWasiBridges(() => k),
+    ...defaultWasiBridges(() => k, () => gm),
     ...passthrough,
     ...userBridges,
   };

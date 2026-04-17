@@ -235,6 +235,17 @@ describe("Phase 4: hardening (WAMR wasi-threads test suite)", () => {
     expect(result.stdout).toContain("watchdog tripped: 1");
   }, 10000);
 
+  test("paged guest memory (identity, 128-slot, 4-slot modes)", () => {
+    // Runs tests/host/test_paged_memory.mjs which loads alloc.wasm in
+    // three configurations: identity (no backend), 128-page hot window
+    // (> logical, no eviction), and 4-page hot window (forces faults).
+    // All three must exit cleanly — proves the page-fault bridge, page
+    // table, and addr_app_to_native paged path are wired end-to-end.
+    const result = runNodeTest("tests/host/test_paged_memory.mjs");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("3 passed, 0 failed");
+  }, 30000);
+
   /* Sanity test for kernel_call_indirect: load a guest, call its exported
    * function via the indirect function table. The full asyncify suspend/
    * resume path is tested end-to-end by the emnapi tsfn suite (which calls
@@ -361,6 +372,18 @@ describeIfRolldown("Phase 5: real napi-rs package — rolldown", () => {
     const result = runNodeTest("tests/host/test_rolldown.mjs");
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("3 passed, 0 failed");
+  }, 60000);
+});
+
+describe("Phase 5: paged memory — worker/browser entry wiring", () => {
+  // Regression guard: entry-browser.js (re-exported by entry-worker.js)
+  // must honour memoryBackend + hotWindowPages. Previously it had its
+  // own inline instantiate that silently ran in identity mode, which
+  // would have shipped broken paging to Cloudflare Workers.
+  test("worker entry activates paging + parseSync correctness", () => {
+    const result = runNodeTest("tests/host/verify_worker_paged.mjs");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("PASS: worker-entry paged memory active");
   }, 60000);
 });
 

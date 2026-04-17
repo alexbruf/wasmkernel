@@ -154,10 +154,26 @@ os_mmap(void *hint, size_t size, int prot, int flags, os_file_handle file)
     if (size == 0)
         return NULL;
 
-    void *p = malloc(size);
-    if (p)
-        memset(p, 0, size);
-    return p;
+    /* Previously: malloc(size) + memset(p, 0, size).
+     *
+     * The memset touched every page of the allocation, which forced V8
+     * to physically commit the whole region at instantiate time — for
+     * a 1004-page guest that's 64 MB of RSS immediately, blowing past
+     * CF's 128 MB isolate cap.
+     *
+     * Omitting the memset is safe: kernel.wasm's WebAssembly.Memory is
+     * zero-initialized by V8 when grown via memory.grow, so freshly-
+     * allocated pages from dlmalloc (which ultimately came from a
+     * memory.grow when the heap last extended) are already zero. We
+     * only recycle allocations after explicit free; none of the paths
+     * that reach wasm_mmap_linear_memory (guest memory allocate, shared
+     * heap allocate) free before reallocating, so recycled-dirty-pages
+     * isn't a hazard for them.
+     *
+     * If we later find a caller that DOES recycle and needs zero-init,
+     * add a separate os_mmap_zeroed() and update that specific caller
+     * rather than re-committing the whole region here. */
+    return malloc(size);
 }
 
 void

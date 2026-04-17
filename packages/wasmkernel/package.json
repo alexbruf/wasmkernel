@@ -1,6 +1,6 @@
 {
   "name": "@alexbruf/wasmkernel",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Drop-in replacement for @napi-rs/wasm-runtime backed by wasmkernel (WAMR cooperatively scheduled). Runs napi-rs addons in Node, browsers, and workers from a single package.",
   "type": "module",
   "license": "MIT",
@@ -29,7 +29,10 @@
     "./browser": "./src/entry-browser.js",
     "./worker": "./src/entry-worker.js",
     "./wasi-passthrough": "./src/wasi_passthrough.js",
-    "./wasmkernel.wasm": "./wasmkernel.wasm"
+    "./wasmkernel.wasm": "./wasmkernel.wasm",
+    "./backends/sqlite-do": "./src/backends/sqlite_do.js",
+    "./backends/sqlite-node": "./src/backends/sqlite_node.js",
+    "./memory-backend": "./src/memory_backend.js"
   },
   "files": [
     "src/**",

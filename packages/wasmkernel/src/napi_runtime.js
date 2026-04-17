@@ -51,9 +51,17 @@ function getAsyncResource() {
   return AsyncResource;
 }
 
+import { GuestMemory } from "./guest_memory.js";
+
 export class NapiRuntime {
-  constructor(kernelExports) {
+  /**
+   * @param {object} kernelExports kernel.wasm exports
+   * @param {GuestMemory|null} gm  optional GuestMemory; constructed in
+   *   identity mode (no page cache) if not provided.
+   */
+  constructor(kernelExports, gm = null) {
     this.k = kernelExports;
+    this.gm = gm ?? new GuestMemory(kernelExports, null);
     this.handles = new Map(); // handle_id -> JS value
     this.nextHandle = 2;     // 0=reserved, 1=env
     this.refs = new Map();   // ref_id -> { handle, refcount }
@@ -190,8 +198,7 @@ export class NapiRuntime {
   _syncGuestToJS(ab) {
     const info = this._abMemory.get(ab);
     if (info && ab.byteLength > 0) {
-      const base = this._guestBase();
-      new Uint8Array(ab).set(new Uint8Array(this._buf(), base + info.address, ab.byteLength));
+      new Uint8Array(ab).set(this.gm.readBytes(info.address, ab.byteLength));
     }
   }
 
@@ -202,50 +209,47 @@ export class NapiRuntime {
   // Write a C bool (1 byte) to guest memory
   _writeBool(guestPtr, value) {
     if (!guestPtr) return;
-    new Uint8Array(this._buf())[this._guestBase() + guestPtr] = value ? 1 : 0;
+    this.gm.writeU8(guestPtr, value ? 1 : 0);
   }
 
-  // Guest memory access via kernel
+  // Legacy accessors — kept for call sites that still use _buf() for
+  // KERNEL-memory addresses (kernel_alloc pointers, raw bridge args arrays).
+  // Guest-memory accesses must go through `this.gm`.
+  _buf() { return this.k.memory.buffer; }
+
+  // DEPRECATED: returns the base offset that used to be used for
+  // identity-mode guest-memory access. Still correct when the paged
+  // memory layer is in identity mode (hot window covers full memory),
+  // but INCORRECT in paging mode because different pages live at
+  // different physical offsets. Remaining call sites that rely on it
+  // still work for non-paged runs; migrate to `this.gm.*` methods when
+  // paging needs to work for NAPI guests.
   _guestBase() {
     return this.k.kernel_guest_memory_base();
   }
 
-  // Always get a fresh buffer — wasm memory.grow detaches the old ArrayBuffer
-  _buf() { return this.k.memory.buffer; }
-
   _readU32(guestPtr) {
-    return new DataView(this._buf()).getUint32(this._guestBase() + guestPtr, true);
+    return this.gm.readU32(guestPtr);
   }
 
   _writeU32(guestPtr, value) {
-    new DataView(this._buf()).setUint32(this._guestBase() + guestPtr, value, true);
+    this.gm.writeU32(guestPtr, value);
   }
 
   _writeI64(guestPtr, value) {
-    new DataView(this._buf()).setBigInt64(this._guestBase() + guestPtr, BigInt(value), true);
+    this.gm.writeI64(guestPtr, value);
   }
 
   _readString(guestPtr, len) {
-    const base = this._guestBase();
-    const bytes = new Uint8Array(this._buf(), base + guestPtr, len);
-    return new TextDecoder().decode(bytes);
+    return this.gm.readString(guestPtr, len);
   }
 
   _readNullTermString(guestPtr) {
-    const base = this._guestBase();
-    const mem = new Uint8Array(this._buf());
-    let end = guestPtr;
-    while (mem[base + end] !== 0) end++;
-    return this._readString(guestPtr, end - guestPtr);
+    return this.gm.readCString(guestPtr);
   }
 
   _writeString(guestPtr, maxLen, str) {
-    const base = this._guestBase();
-    const bytes = new TextEncoder().encode(str);
-    const writeLen = Math.min(bytes.length, maxLen);
-    const target = new Uint8Array(this._buf(), base + guestPtr, writeLen);
-    target.set(bytes.subarray(0, writeLen));
-    return writeLen;
+    return this.gm.writeStringUtf8(guestPtr, str, maxLen);
   }
 
   // Write a handle to a guest result pointer. Returns false if ptr is NULL.
@@ -322,9 +326,8 @@ export class NapiRuntime {
       // Don't split multi-byte UTF-8 characters
       let toWrite = Math.min(encoded.length, maxWrite);
       while (toWrite > 0 && (encoded[toWrite] & 0xC0) === 0x80) toWrite--;
-      const base = this._guestBase();
-      new Uint8Array(this._buf()).set(encoded.subarray(0, toWrite), base + bufPtr);
-      new Uint8Array(this._buf())[base + bufPtr + toWrite] = 0;
+      this.gm.writeBytes(bufPtr, encoded.subarray(0, toWrite));
+      this.gm.writeU8(bufPtr + toWrite, 0);
       if (resultPtr) this._writeU32(resultPtr, toWrite);
     } else if (resultPtr) {
       // No buffer — just report the full byte length needed
@@ -576,7 +579,7 @@ export class NapiRuntime {
   // Allocate a guest memory-backed ref and return the guest address
   _allocRefPtr(refId) {
     const guestAddr = this._guestAlloc(4);
-    new DataView(this._buf()).setUint32(this._guestBase() + guestAddr, refId, true);
+    this.gm.writeU32(guestAddr, refId);
     this._refPtrToId = this._refPtrToId || new Map();
     this._refPtrToId.set(guestAddr, refId);
     return guestAddr;
@@ -935,7 +938,6 @@ export class NapiRuntime {
     const guestSize = this.k.kernel_guest_memory_size();
     const errorStructGuestAddr = guestSize - 512; // near end of guest memory
     const msgGuestAddr = errorStructGuestAddr + 16;
-    const base = this._guestBase();
     const status = this._lastStatus ?? 0;
     const messages = [
       null, 'Invalid argument', 'An object was expected', 'A string was expected',
@@ -946,9 +948,9 @@ export class NapiRuntime {
     const msg = messages[status] ?? null;
     let errorMsgGuestPtr = 0;
     if (msg) {
-      const mem = new Uint8Array(this._buf());
-      for (let i = 0; i < msg.length; i++) mem[base + msgGuestAddr + i] = msg.charCodeAt(i);
-      mem[base + msgGuestAddr + msg.length] = 0;
+      const bytes = new Uint8Array(msg.length + 1);
+      for (let i = 0; i < msg.length; i++) bytes[i] = msg.charCodeAt(i);
+      this.gm.writeBytes(msgGuestAddr, bytes);
       errorMsgGuestPtr = msgGuestAddr;
     }
     this._writeU32(errorStructGuestAddr, errorMsgGuestPtr);
@@ -965,8 +967,7 @@ export class NapiRuntime {
     if (!valueHandle || !resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
     if (typeof val !== 'number') return napi_number_expected;
-    const base = this._guestBase();
-    new DataView(this._buf()).setInt32(base + resultPtr, Number(val) | 0, true);
+    this.gm.writeI32(resultPtr, Number(val) | 0);
     return napi_ok;
   }
 
@@ -986,7 +987,6 @@ export class NapiRuntime {
     if (!valueHandle || !resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
     if (typeof val !== 'number') return napi_number_expected;
-    const base = this._guestBase();
     // Convert to int64 via BigInt — setBigInt64 handles wrapping naturally
     let i64val;
     const trunc = Math.trunc(val);
@@ -1001,7 +1001,7 @@ export class NapiRuntime {
     const INT64_MIN = -9223372036854775808n;
     if (i64val > INT64_MAX) i64val = INT64_MAX;
     else if (i64val < INT64_MIN) i64val = INT64_MIN;
-    new DataView(this._buf()).setBigInt64(base + resultPtr, i64val, true);
+    this.gm.writeI64(resultPtr, i64val);
     return napi_ok;
   }
 
@@ -1011,8 +1011,7 @@ export class NapiRuntime {
     if (!valueHandle || !resultPtr) return napi_invalid_arg;
     const val = this._getHandle(valueHandle);
     if (typeof val !== 'number') return napi_number_expected;
-    const base = this._guestBase();
-    new DataView(this._buf()).setFloat64(base + resultPtr, Number(val), true);
+    this.gm.writeF64(resultPtr, Number(val));
     return napi_ok;
   }
 
@@ -1106,15 +1105,15 @@ export class NapiRuntime {
       this._writeResult(resultPtr, h);
       return napi_ok;
     }
-    const base = this._guestBase();
-    const mem = new Uint8Array(this._buf());
     let str;
     if (len === 0xFFFFFFFF || len === -1) {
       let end = strPtr;
-      while (mem[base + end] !== 0) end++;
-      str = Array.from(mem.subarray(base + strPtr, base + end), b => String.fromCharCode(b)).join('');
+      while (this.gm.readU8(end) !== 0) end++;
+      const bytes = this.gm.readBytes(strPtr, end - strPtr);
+      str = Array.from(bytes, b => String.fromCharCode(b)).join('');
     } else {
-      str = Array.from(mem.subarray(base + strPtr, base + strPtr + len), b => String.fromCharCode(b)).join('');
+      const bytes = this.gm.readBytes(strPtr, len);
+      str = Array.from(bytes, b => String.fromCharCode(b)).join('');
     }
     const h = this._newHandle(str);
     this._writeResult(resultPtr, h);
@@ -1179,10 +1178,7 @@ export class NapiRuntime {
         if (prop === '_isGuestBuffer') return true;
 
         // Snapshot current content for string/iteration operations
-        const snap = () => {
-          const base = self._guestBase();
-          return Buffer.from(new Uint8Array(self._buf(), base + guestPtr, length));
-        };
+        const snap = () => Buffer.from(self.gm.readBytes(guestPtr, length));
 
         if (prop === 'toString') return function(enc) { return snap().toString(enc); };
         if (prop === 'toJSON') return function() { return snap().toJSON(); };
@@ -1192,16 +1188,15 @@ export class NapiRuntime {
         if (prop === 'compare') return function(b) { return snap().compare(b); };
         if (prop === 'write') return function(str, off, len, enc) {
           const b = Buffer.from(str, enc);
-          const base = self._guestBase();
           const writeLen = Math.min(b.length, length - (off || 0));
-          new Uint8Array(self._buf()).set(b.subarray(0, writeLen), base + guestPtr + (off || 0));
+          self.gm.writeBytes(guestPtr + (off || 0), b.subarray(0, writeLen));
           return writeLen;
         };
         if (prop === Symbol.iterator) return function*() { const s = snap(); for (const b of s) yield b; };
         if (typeof prop === 'string' && /^\d+$/.test(prop)) {
           const idx = Number(prop);
           if (idx >= 0 && idx < length) {
-            return new Uint8Array(self._buf())[self._guestBase() + guestPtr + idx];
+            return self.gm.readU8(guestPtr + idx);
           }
           return undefined;
         }
@@ -1215,7 +1210,7 @@ export class NapiRuntime {
         if (typeof prop === 'string' && /^\d+$/.test(prop)) {
           const idx = Number(prop);
           if (idx >= 0 && idx < length) {
-            new Uint8Array(self._buf())[self._guestBase() + guestPtr + idx] = value;
+            self.gm.writeU8(guestPtr + idx, value);
             return true;
           }
         }
@@ -1227,10 +1222,7 @@ export class NapiRuntime {
 
   _getGuestArrayBuffer(guestPtr, length) {
     // Return a snapshot ArrayBuffer (can't proxy ArrayBuffer easily)
-    const base = this._guestBase();
-    return new Uint8Array(this._buf(), base + guestPtr, length).buffer.slice(
-      base + guestPtr, base + guestPtr + length
-    );
+    return this.gm.readBytes(guestPtr, length).buffer;
   }
 
   // ===== Buffer API =====
@@ -1249,10 +1241,8 @@ export class NapiRuntime {
     const [env, length, dataGuestPtr, dataPtrOut, resultPtr] = args;
     const guestPtr = length > 0 ? this.k.kernel_alloc(length) : 0;
     if (guestPtr && dataGuestPtr) {
-      // Copy source data to new allocation in guest memory
-      const base = this._guestBase();
-      const mem = new Uint8Array(this._buf());
-      mem.copyWithin(base + guestPtr, base + dataGuestPtr, base + dataGuestPtr + length);
+      // Copy source data to new allocation in guest memory.
+      this.gm.writeBytes(guestPtr, this.gm.readBytes(dataGuestPtr, length));
     }
     if (dataPtrOut) this._writeU32(dataPtrOut, guestPtr);
     const buf = this._createGuestBuffer(guestPtr, length);
@@ -1281,9 +1271,9 @@ export class NapiRuntime {
     }
     // Always sync JS content to guest memory
     if (this._abMemory.has(val) && val.byteLength > 0) {
-      const base = this._guestBase();
       const info = this._abMemory.get(val);
-      new Uint8Array(this._buf()).set(new Uint8Array(val.buffer, val.byteOffset, val.byteLength), base + info.address);
+      this.gm.writeBytes(info.address,
+        new Uint8Array(val.buffer, val.byteOffset, val.byteLength));
     }
     const info = this._abMemory.get(val);
     if (dataPtr) this._writeU32(dataPtr, info?.address ?? 0);
@@ -1313,8 +1303,7 @@ export class NapiRuntime {
     // Allocate in guest-accessible memory (same as napi_create_arraybuffer)
     const guestAddr = byteLength > 0 ? this._guestAlloc(byteLength) : 0;
     if (guestAddr) {
-      const base = this._guestBase();
-      new Uint8Array(this._buf()).fill(0, base + guestAddr, base + guestAddr + byteLength);
+      this.gm.writeBytes(guestAddr, new Uint8Array(byteLength));
     }
     const sab = new SharedArrayBuffer(byteLength);
     this._abMemory.set(sab, { address: guestAddr, ownership: 0, runtimeAllocated: 1 }); // emnapi_runtime
@@ -1368,9 +1357,9 @@ export class NapiRuntime {
     const filename = this._moduleFilename || "";
     const encoded = new TextEncoder().encode(filename);
     const guestAddr = this._guestAlloc(encoded.length + 1);
-    const base = this._guestBase();
-    new Uint8Array(this._buf()).set(encoded, base + guestAddr);
-    new Uint8Array(this._buf())[base + guestAddr + encoded.length] = 0;
+    const withNul = new Uint8Array(encoded.length + 1);
+    withNul.set(encoded);
+    this.gm.writeBytes(guestAddr, withNul);
     this._writeU32(resultPtr, guestAddr);
     return napi_ok;
   }
@@ -1379,15 +1368,15 @@ export class NapiRuntime {
   node_api_create_external_string_latin1(args) {
     const [env, strPtr, length, finalizeCb, finalizeHint, resultPtr, copiedPtr] = args;
     // Latin1: read bytes and convert via String.fromCharCode (not TextDecoder which is UTF-8)
-    const base = this._guestBase();
-    const mem = new Uint8Array(this._buf());
     let str;
     if (length === 0xFFFFFFFF || length === -1) {
       let end = strPtr;
-      while (mem[base + end] !== 0) end++;
-      str = Array.from(mem.subarray(base + strPtr, base + end), b => String.fromCharCode(b)).join('');
+      while (this.gm.readU8(end) !== 0) end++;
+      const bytes = this.gm.readBytes(strPtr, end - strPtr);
+      str = Array.from(bytes, b => String.fromCharCode(b)).join('');
     } else {
-      str = Array.from(mem.subarray(base + strPtr, base + strPtr + length), b => String.fromCharCode(b)).join('');
+      const bytes = this.gm.readBytes(strPtr, length);
+      str = Array.from(bytes, b => String.fromCharCode(b)).join('');
     }
     const h = this._newHandle(str);
     this._writeResult(resultPtr, h);
@@ -1396,20 +1385,19 @@ export class NapiRuntime {
   }
   node_api_create_external_string_utf16(args) {
     const [env, strPtr, length, finalizeCb, finalizeHint, resultPtr, copiedPtr] = args;
-    const base = this._guestBase();
     let str = '';
     const actualLen = length === 0xFFFFFFFF ? -1 : length;
     if (actualLen === -1) {
       let i = 0;
       while (true) {
-        const ch = new DataView(this._buf()).getUint16(base + strPtr + i * 2, true);
+        const ch = this.gm.readU16(strPtr + i * 2);
         if (ch === 0) break;
         str += String.fromCharCode(ch);
         i++;
       }
     } else {
       for (let i = 0; i < actualLen; i++) {
-        str += String.fromCharCode(new DataView(this._buf()).getUint16(base + strPtr + i * 2, true));
+        str += String.fromCharCode(this.gm.readU16(strPtr + i * 2));
       }
     }
     const h = this._newHandle(str);
@@ -1511,9 +1499,8 @@ export class NapiRuntime {
         this._abMemory.set(ab, { address: guestAddr, ownership: 0, runtimeAllocated: 1 });
       }
       if (ab instanceof ArrayBuffer && this._abMemory.has(ab) && ab.byteLength > 0) {
-        const base = this._guestBase();
         const info = this._abMemory.get(ab);
-        new Uint8Array(this._buf()).set(new Uint8Array(ab), base + info.address);
+        this.gm.writeBytes(info.address, new Uint8Array(ab));
       }
       const info = this._abMemory.get(ab);
       this._writeU32(dataPtr, info ? info.address + (val?.byteOffset ?? 0) : 0);
@@ -1564,12 +1551,10 @@ export class NapiRuntime {
     const stackBase = this._threadAllocOffset;
     this._threadAllocOffset += stackSize;
     const stackTop = stackBase + stackSize;
-    const base = this._guestBase();
-    const dv = new DataView(this._buf());
-    dv.setUint32(base + argsAddr + 0, stackTop, true);    // stack (grows down)
-    dv.setUint32(base + argsAddr + 4, tlsBase, true);      // tls_base
-    dv.setUint32(base + argsAddr + 8, entryFuncPtr, true);  // start_func
-    dv.setUint32(base + argsAddr + 12, argPtr, true);       // start_arg
+    this.gm.writeU32(argsAddr + 0, stackTop);    // stack (grows down)
+    this.gm.writeU32(argsAddr + 4, tlsBase);      // tls_base
+    this.gm.writeU32(argsAddr + 8, entryFuncPtr);  // start_func
+    this.gm.writeU32(argsAddr + 12, argPtr);       // start_arg
 
     // Call wasi.thread-spawn via the kernel
     // The kernel handles this by creating a new instance and registering
@@ -1643,8 +1628,7 @@ export class NapiRuntime {
     if (addressPtr) this._writeU32(addressPtr, info?.address ?? 0);
     if (ownershipPtr) this._writeU32(ownershipPtr, info?.ownership ?? 1);
     if (runtimeAllocatedPtr) {
-      const base = this._guestBase();
-      new Uint8Array(this._buf())[base + runtimeAllocatedPtr] = info?.runtimeAllocated ?? 0;
+      this.gm.writeU8(runtimeAllocatedPtr, info?.runtimeAllocated ?? 0);
     }
     return napi_ok;
   }
@@ -1659,14 +1643,13 @@ export class NapiRuntime {
     if (!ab) return napi_ok;
     const info = this._abMemory.get(ab);
     if (!info || ab.byteLength === 0) return napi_ok;
-    const base = this._guestBase();
     const offset = byteOffset || 0;
     const len = (byteLength === 0xFFFFFFFF || !byteLength) ? ab.byteLength - offset : Math.min(byteLength, ab.byteLength - offset);
     if (len <= 0) return napi_ok;
     if (jsToWasm) {
-      new Uint8Array(this._buf(), base + info.address + offset, len).set(new Uint8Array(ab, offset, len));
+      this.gm.writeBytes(info.address + offset, new Uint8Array(ab, offset, len));
     } else {
-      new Uint8Array(ab, offset, len).set(new Uint8Array(this._buf(), base + info.address + offset, len));
+      new Uint8Array(ab, offset, len).set(this.gm.readBytes(info.address + offset, len));
     }
     return napi_ok;
   }
@@ -1681,14 +1664,13 @@ export class NapiRuntime {
     const val = v;
     // UTF-16 encoding
     if (bufPtr && bufSize > 0) {
-      const base = this._guestBase();
       const maxChars = bufSize - 1; // leave room for null terminator
       const writeLen = Math.min(val.length, maxChars);
       for (let i = 0; i < writeLen; i++) {
-        new DataView(this._buf()).setUint16(base + bufPtr + i * 2, val.charCodeAt(i), true);
+        this.gm.writeU16(bufPtr + i * 2, val.charCodeAt(i));
       }
       // null terminate
-      new DataView(this._buf()).setUint16(base + bufPtr + writeLen * 2, 0, true);
+      this.gm.writeU16(bufPtr + writeLen * 2, 0);
       if (resultPtr) this._writeU32(resultPtr, writeLen);
     } else if (resultPtr) {
       this._writeU32(resultPtr, val.length);
@@ -1705,13 +1687,12 @@ export class NapiRuntime {
     if (!bufPtr && !resultPtr) return napi_invalid_arg;
     const val = v;
     if (bufPtr && bufSize > 0) {
-      const base = this._guestBase();
       const writeLen = Math.min(val.length, bufSize - 1);
-      const mem = new Uint8Array(this._buf());
+      const bytes = new Uint8Array(writeLen + 1);
       for (let i = 0; i < writeLen; i++) {
-        mem[base + bufPtr + i] = val.charCodeAt(i) & 0xFF;
+        bytes[i] = val.charCodeAt(i) & 0xFF;
       }
-      mem[base + bufPtr + writeLen] = 0;
+      this.gm.writeBytes(bufPtr, bytes);
       if (resultPtr) this._writeU32(resultPtr, writeLen);
     } else if (resultPtr) {
       this._writeU32(resultPtr, val.length);
@@ -1730,20 +1711,19 @@ export class NapiRuntime {
       this._writeResult(resultPtr, h);
       return napi_ok;
     }
-    const base = this._guestBase();
     const actualLen = len === 0xFFFFFFFF ? -1 : len;
     let str = '';
     if (actualLen === -1) {
       let i = 0;
       while (true) {
-        const ch = new DataView(this._buf()).getUint16(base + strPtr + i * 2, true);
+        const ch = this.gm.readU16(strPtr + i * 2);
         if (ch === 0) break;
         str += String.fromCharCode(ch);
         i++;
       }
     } else {
       for (let i = 0; i < actualLen; i++) {
-        str += String.fromCharCode(new DataView(this._buf()).getUint16(base + strPtr + i * 2, true));
+        str += String.fromCharCode(this.gm.readU16(strPtr + i * 2));
       }
     }
     const h = this._newHandle(str);
@@ -1758,10 +1738,8 @@ export class NapiRuntime {
     let matches = false;
     if (obj && obj._typeTagLo !== undefined && typeTagPtr) {
       // Compare 128-bit tag values (lo + hi u64)
-      const base = this._guestBase();
-      const dv = new DataView(this._buf());
-      const lo = dv.getBigUint64(base + typeTagPtr, true);
-      const hi = dv.getBigUint64(base + typeTagPtr + 8, true);
+      const lo = this.gm.readU64(typeTagPtr);
+      const hi = this.gm.readU64(typeTagPtr + 8);
       matches = obj._typeTagLo === lo && obj._typeTagHi === hi;
     }
     this._writeBool(resultPtr, matches);
@@ -1771,10 +1749,8 @@ export class NapiRuntime {
     const [env, objectHandle, typeTagPtr] = args;
     const obj = this._getHandle(objectHandle);
     if (obj && typeof obj === 'object' && typeTagPtr) {
-      const base = this._guestBase();
-      const dv = new DataView(this._buf());
-      obj._typeTagLo = dv.getBigUint64(base + typeTagPtr, true);
-      obj._typeTagHi = dv.getBigUint64(base + typeTagPtr + 8, true);
+      obj._typeTagLo = this.gm.readU64(typeTagPtr);
+      obj._typeTagHi = this.gm.readU64(typeTagPtr + 8);
     }
     return napi_ok;
   }
@@ -1799,9 +1775,8 @@ export class NapiRuntime {
     const maxWords = wordCountPtr ? this._readU32(wordCountPtr) : 0;
     if (wordCountPtr) this._writeU32(wordCountPtr, words.length);
     if (wordsPtr) {
-      const base = this._guestBase();
       for (let i = 0; i < Math.min(words.length, maxWords); i++) {
-        new DataView(this._buf()).setBigUint64(base + wordsPtr + i * 8, words[i], true);
+        this.gm.writeU64(wordsPtr + i * 8, words[i]);
       }
     }
     return napi_ok;
@@ -1822,9 +1797,8 @@ export class NapiRuntime {
     }
     try {
       let val = 0n;
-      const base = this._guestBase();
       for (let i = 0; i < wordCount; i++) {
-        const word = new DataView(this._buf()).getBigUint64(base + wordsPtr + i * 8, true);
+        const word = this.gm.readU64(wordsPtr + i * 8);
         val += word << (BigInt(i) * 64n);
       }
       if (signBit) val = -val;
@@ -1983,28 +1957,6 @@ export class NapiRuntime {
     this.lastException = new RangeError(msg);
     if (code) this.lastException.code = code;
     this.exceptionPending = true;
-    return napi_ok;
-  }
-
-  // napi_throw_syntax_error(env, code, msg)
-  napi_throw_syntax_error(args) {
-    const [env, codePtr, msgPtr] = args;
-    const code = codePtr ? this._readNullTermString(codePtr) : '';
-    const msg = msgPtr ? this._readNullTermString(msgPtr) : '';
-    this.lastException = new SyntaxError(msg);
-    if (code) this.lastException.code = code;
-    this.exceptionPending = true;
-    return napi_ok;
-  }
-
-  // napi_create_syntax_error(env, code, msg, result)
-  napi_create_syntax_error(args) {
-    const [env, codeHandle, msgHandle, resultPtr] = args;
-    const msg = this._getHandle(msgHandle);
-    const err = new SyntaxError(typeof msg === 'string' ? msg : String(msg));
-    if (codeHandle) { const code = this._getHandle(codeHandle); if (code) err.code = code; }
-    const h = this._newHandle(err);
-    this._writeResult(resultPtr, h);
     return napi_ok;
   }
 
@@ -2354,8 +2306,7 @@ export class NapiRuntime {
   napi_get_date_value(args) {
     const [env, valueHandle, resultPtr] = args;
     const val = this._getHandle(valueHandle);
-    const base = this._guestBase();
-    new DataView(this._buf()).setFloat64(base + resultPtr, val instanceof Date ? val.getTime() : 0, true);
+    this.gm.writeF64(resultPtr, val instanceof Date ? val.getTime() : 0);
     return napi_ok;
   }
 
@@ -2373,10 +2324,9 @@ export class NapiRuntime {
       this._writeU32(sp + 8, parseInt(parts[2]) || 0);
       const rel = typeof process !== 'undefined' ? (process.release?.name ?? 'node') : 'node';
       const rp = this.k.kernel_alloc(rel.length + 1);
-      const base = this._guestBase();
-      const mem = new Uint8Array(this._buf());
-      for (let i = 0; i < rel.length; i++) mem[base + rp + i] = rel.charCodeAt(i);
-      mem[base + rp + rel.length] = 0;
+      const relBytes = new Uint8Array(rel.length + 1);
+      for (let i = 0; i < rel.length; i++) relBytes[i] = rel.charCodeAt(i);
+      this.gm.writeBytes(rp, relBytes);
       this._writeU32(sp + 12, rp);
     }
     // Write pointer-to-struct at resultPtr
@@ -2728,8 +2678,7 @@ export class NapiRuntime {
     const guestAddr = byteLength > 0 ? this._guestAlloc(byteLength) : 0;
     // Zero-initialize
     if (guestAddr) {
-      const base = this._guestBase();
-      new Uint8Array(this._buf()).fill(0, base + guestAddr, base + guestAddr + byteLength);
+      this.gm.writeBytes(guestAddr, new Uint8Array(byteLength));
     }
     const ab = new ArrayBuffer(byteLength);
     this._abMemory.set(ab, { address: guestAddr, ownership: 0, runtimeAllocated: 1 }); // emnapi_runtime
@@ -2757,9 +2706,8 @@ export class NapiRuntime {
       }
       // Always sync JS content to guest memory
       if (this._abMemory.has(val) && val.byteLength > 0) {
-        const base = this._guestBase();
         const info = this._abMemory.get(val);
-        new Uint8Array(this._buf()).set(new Uint8Array(val), base + info.address);
+        this.gm.writeBytes(info.address, new Uint8Array(val));
       }
       const info = this._abMemory.get(val);
       if (dataPtr) this._writeU32(dataPtr, info?.address ?? 0);
@@ -2814,9 +2762,8 @@ export class NapiRuntime {
       }
       // Always sync
       if (ab instanceof ArrayBuffer && this._abMemory.has(ab) && ab.byteLength > 0) {
-        const base = this._guestBase();
         const info = this._abMemory.get(ab);
-        new Uint8Array(this._buf()).set(new Uint8Array(ab), base + info.address);
+        this.gm.writeBytes(info.address, new Uint8Array(ab));
       }
       const info = this._abMemory.get(ab);
       this._writeU32(dataPtr, info ? info.address + (val?.byteOffset ?? 0) : 0);
@@ -2893,12 +2840,10 @@ export class NapiRuntime {
     // Write lossless FIRST (bool = 1 byte, may be adjacent to u64)
     if (losslessPtr) {
       const lossless = n >= 0n && n <= 0xFFFFFFFFFFFFFFFFn ? 1 : 0;
-      const base = this._guestBase();
-      new Uint8Array(this._buf())[base + losslessPtr] = lossless;
+      this.gm.writeU8(losslessPtr, lossless);
     }
     // Then write the u64 value
-    const base = this._guestBase();
-    new DataView(this._buf()).setBigUint64(base + resultPtr, n < 0n ? 0n : n, true);
+    this.gm.writeU64(resultPtr, n < 0n ? 0n : n);
     return napi_ok;
   }
 
@@ -2914,6 +2859,9 @@ export class NapiRuntime {
 
   // Dispatch: find the right method by function name
   dispatch(funcName, args, argsPtr) {
+    if (process.env.NAPI_TRACE) {
+      process.stderr.write(`[napi] ${funcName}(${args.join(",")})\n`);
+    }
     this._currentArgsPtr = argsPtr;
     // Capture guest env pointer for use in finalizer callbacks
     if (args[0] && funcName.startsWith('napi_')) this._guestEnv = args[0];
